@@ -5,7 +5,7 @@
 ## 1. 模块图与文件职责
 
 ```text
-9 个 run_*.sh launcher
+11 个 run_*.sh launcher
 ├── 6 个通用 launcher ───────────────┐
 ├── 1 个 5659 同步 EE preset ──> 通用 EE launcher
 └── 2 个 EE rollout preset ─────> 通用 EE rollout launcher
