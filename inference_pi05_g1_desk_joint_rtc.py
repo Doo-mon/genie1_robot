@@ -107,6 +107,7 @@ def main(args: JointRTCArgs) -> None:
                             raw_model_action=raw,
                             episode_step=step,
                             source="joint_rtc_effective_target",
+                            environment=env,
                         )
                     ),
                 ).run()

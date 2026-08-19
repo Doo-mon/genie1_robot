@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# 启动命令：bash ./run_inference_pi05_g1_desk_ee_rtc.sh
+#
 # 通用异步 EE RTC 推理入口，直接调用 inference_pi05_g1_desk_ee_rtc.py。
-# 服务地址、任务名、action horizon、RTC prefix/refill、prefix 夹爪范围、是否
-# 二值化、控制频率和 EE 安全阈值均取自同名环境变量。WS_* 另外控制慢启动等待、握手/响应超时和指数退避；
-# 夹爪按 0=张开、1=闭合解释；默认用 close=0.90/open=0.10 双阈值滞回，
+# 服务地址、任务名、action horizon、RTC prefix/refill、是否二值化、控制频率
+# 和 EE 安全阈值均取自同名环境变量；prefix 夹爪范围固定为 0--1。WS_* 另外
+# 控制慢启动等待、握手/响应超时和指数退避；
+# 夹爪按 0=张开、1=闭合解释；默认用 close=0.90/open=0.50 双阈值滞回，
 # 只有显式提供旧 GRIPPER_THRESHOLD 时才退回无记忆的单阈值。
 # 已发送请求默认不重发，只有 WS_INFERENCE_RETRIES>0 才断线重连重发。
 # PROMPT（兼容 FIXED_PROMPT）优先于 PROMPT_KEY；都为空时进入 Python 交互菜单，
@@ -10,7 +13,8 @@
 # 本 launcher 捕获 Python 控制台并在其退出后收尾；其中变量只在该启动链的子进程中生效，
 # 不会修改调用它的父终端环境。
 # 每次运行会在 ACTION_LOG_ROOT（默认本目录/logs）建立时间戳目录并保存 console.log；
-# PLOT_ACTIONS 默认 true，退出后绘制动作对比图且不覆盖 Python 原退出码。
+# 动作 JSONL/真实 feedback 默认关闭；ACTION_LOGGING=true 时才记录，且
+# PLOT_ACTIONS 默认 true，会在退出后绘图且不覆盖 Python 原退出码。
 # set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,7 +46,7 @@ MAX_ROTATION_DELTA="${MAX_ROTATION_DELTA:-0.0025}"
 # 单点 SDK 轨迹尚未完成就被下一条命令替换，从而产生反复启停和抖动。
 TRAJECTORY_TIME="${TRAJECTORY_TIME:-0.03}"
 GRIPPER_CLOSE_THRESHOLD="${GRIPPER_CLOSE_THRESHOLD:-0.90}"
-GRIPPER_OPEN_THRESHOLD="${GRIPPER_OPEN_THRESHOLD:-0.10}"
+GRIPPER_OPEN_THRESHOLD="${GRIPPER_OPEN_THRESHOLD:-0.50}"
 PROMPT="${PROMPT:-${FIXED_PROMPT:-}}"
 PROMPT_KEY="${PROMPT_KEY:-}"
 

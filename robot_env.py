@@ -231,13 +231,27 @@ class RobotEnv:
 
         (left_pos, left_aa), (right_pos, right_aa) = self.retargeter.process_kinematics(state_vec)
             
-        pose = np.concatenate([
-            left_pos[0], left_aa[0], [joint_state[7]],
-            right_pos[0], right_aa[0], [joint_state[15]]
-        ])
+        # EE policy feedback is exactly left EE7 followed by right EE7.  Keep
+        # this packing explicit and validate it here so an accidental duplicate
+        # arm (for example left + left + right, 21-D) fails at the sensor
+        # boundary instead of shifting every downstream RTC/action dimension.
+        pose = _finite_vector(
+            np.concatenate(
+                [
+                    left_pos[0],
+                    left_aa[0],
+                    [joint_state[7]],
+                    right_pos[0],
+                    right_aa[0],
+                    [joint_state[15]],
+                ]
+            ),
+            size=14,
+            name="EE姿态反馈（left EE7 + right EE7）",
+        )
 
         return {
-            "state/pose": pose.astype(np.float32),
+            "state/pose": pose.copy(),
             "state/head": head_states,
             "state/waist": waist_states,
         }
@@ -421,6 +435,56 @@ class RobotEnv:
     def get_joint_state(self) -> np.ndarray:
         with self._io_lock:
             return self.robot_node.get_joint_state()
+
+    def get_control_feedback(self) -> tuple[np.ndarray, int]:
+        """Read physical feedback in the same 14D/16D space as local commands.
+
+        This intentionally skips all camera reads.  Joint/pose components come
+        from fresh SDK feedback; the two gripper encoder values are normalized
+        from the project's 0--120 state contract into the command-side 0--1
+        range so offline plots do not compare incompatible units.  The returned
+        timestamp is the local wall-clock time immediately after sampling, not
+        the SDK command-completion time.
+        """
+
+        with self._io_lock:
+            joint_state = _finite_vector(
+                self.robot_node.get_joint_state(), size=16, name="关节反馈"
+            )
+            if self.control_mode == "joint_position":
+                feedback = joint_state.copy()
+                gripper_indices = (7, 15)
+            elif self.control_mode == "camera_position":
+                feedback = self._compute_pose_state(joint_state)["state/pose"].copy()
+                gripper_indices = (6, 13)
+            else:
+                raise ValueError(f"未知控制模式: {self.control_mode}")
+
+            for index in gripper_indices:
+                raw_value = float(feedback[index])
+                if not 0.0 <= raw_value <= 120.0:
+                    raise RuntimeError(
+                        f"夹爪反馈超出 [0, 120]: index={index}, value={raw_value}"
+                    )
+                feedback[index] = raw_value / 120.0
+            return feedback.astype(np.float32, copy=False), time.time_ns()
+
+    def step_with_control_feedback(
+        self, action: np.ndarray
+    ) -> tuple[np.ndarray, int]:
+        """Atomically submit one command and sample same-space feedback.
+
+        EE RTC gripper synchronization uses this path only while a gripper
+        transition is gated.  Holding the outer ``RLock`` across both calls
+        prevents rollout or observation threads from inserting another SDK
+        access between command submission and the physical feedback sample.
+        The returned state is still asynchronous instantaneous feedback; it is
+        the gate's measured input, not a claim that the command completed.
+        """
+
+        with self._io_lock:
+            self.step(action, update_obs=False)
+            return self.get_control_feedback()
 
     def get_obs_with_last_action(
         self,

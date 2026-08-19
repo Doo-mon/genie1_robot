@@ -53,9 +53,15 @@ def main(args: RTCArgs) -> None:
     print(f"  RTC prefix gripper range: {args.rtc_prefix_gripper_range}")
     print(f"  binarize gripper action: {args.binarize_gripper}")
     print(
-        "  synchronize gripper with arm target: "
+        "  synchronize gripper with physical EE feedback: "
         f"{args.sync_gripper_to_arm} "
-        f"(timeout={args.gripper_sync_timeout:g}s)"
+        f"(pos_tol={args.gripper_sync_position_tolerance:g}m, "
+        f"rot_tol={args.gripper_sync_rotation_tolerance:g}rad, "
+        f"stable_frames={args.gripper_sync_stable_frames}, "
+        f"gripper_hold={args.gripper_settle_time:g}s, "
+        f"min_timeout={args.gripper_sync_timeout:g}s, "
+        f"max_timeout={args.gripper_sync_max_timeout:g}s, "
+        f"replan={args.replan_after_gripper_sync})"
     )
     if args.binarize_gripper:
         if args.gripper_threshold is not None:
@@ -124,13 +130,19 @@ def main(args: RTCArgs) -> None:
                     policy,
                     prompt,
                     initial_obs,
-                    action_trace_callback=lambda model, actual, step, raw: (
+                    action_trace_callback=lambda model, actual, step, raw, feedback, feedback_ts: (
                         action_log.log_action(
                             model,
                             actual,
                             raw_model_action=raw,
                             episode_step=step,
                             source="ee_rtc_effective_target",
+                            environment=env,
+                            feedback_sample=(
+                                (feedback, feedback_ts)
+                                if env is not None and feedback is not None
+                                else None
+                            ),
                         )
                     ),
                 ).run()

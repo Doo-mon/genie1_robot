@@ -62,7 +62,10 @@ inference_log_init() {
       ;;
   esac
 
-  case "${ACTION_LOGGING:-true}" in
+  # Real feedback logging performs an extra synchronous SDK/FK read per
+  # command.  Keep it opt-in so diagnostics cannot silently consume the
+  # 20/30 Hz control budget.  console.log is always retained.
+  case "${ACTION_LOGGING:-false}" in
     1|true|TRUE|yes|YES)
       INFERENCE_LOG_ACTIONS_ENABLED=true
       ;;

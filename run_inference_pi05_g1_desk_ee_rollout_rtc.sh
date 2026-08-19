@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# 启动命令：bash ./run_inference_pi05_g1_desk_ee_rollout_rtc.sh
+#
 # 通用异步 EE RTC + rollout 入口，直接调用 inference_pi05_g1_desk_ee_rollout_rtc.py。
-# 网络、任务、RTC（含 prefix 夹爪范围/可选二值化）、控制安全参数及 rollout 配置来自同名环境变量。
-# 夹爪约定 0=张开、1=闭合，默认启用 close=0.90/open=0.10 双阈值滞回；
+# 网络、任务、RTC、可选二值化、控制安全参数及 rollout 配置来自同名环境变量；
+# prefix 夹爪范围固定为 0--1，不提供 Shell 切换参数。
+# 夹爪约定 0=张开、1=闭合，默认启用 close=0.90/open=0.50 双阈值滞回；
 # rollout 保存经过该处理后实际发送的命令，旧单阈值只作为显式兼容覆盖。
 # WS_* 控制慢启动等待、握手/响应超时和退避；默认不重发已经发送的请求，
 # 仅 WS_INFERENCE_RETRIES>0 才重连重发。"$@" 可继续覆盖 Python 参数。
@@ -9,7 +12,8 @@
 # 选定的 prompt 必须确认后才会 reset、warmup、执行或开始录制。
 # 本文件只把配置传给随后运行的 Python 子进程，正常执行不会污染父终端变量。
 # 每次运行会在 ACTION_LOG_ROOT（默认本目录/logs）建立时间戳目录并保存 console.log；
-# PLOT_ACTIONS 默认 true，退出后绘制动作对比图且不覆盖 Python 原退出码。
+# 动作 JSONL/真实 feedback 默认关闭；ACTION_LOGGING=true 时才记录，且
+# PLOT_ACTIONS 默认 true，会在退出后绘图且不覆盖 Python 原退出码。
 # set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +45,7 @@ MAX_ROTATION_DELTA="${MAX_ROTATION_DELTA:-0.0025}"
 # 每条单点轨迹执行到一半就被下一条命令打断。
 TRAJECTORY_TIME="${TRAJECTORY_TIME:-0.03}"
 GRIPPER_CLOSE_THRESHOLD="${GRIPPER_CLOSE_THRESHOLD:-0.90}"
-GRIPPER_OPEN_THRESHOLD="${GRIPPER_OPEN_THRESHOLD:-0.10}"
+GRIPPER_OPEN_THRESHOLD="${GRIPPER_OPEN_THRESHOLD:-0.50}"
 ROLLOUT_FPS="${ROLLOUT_FPS:-30}"
 ROLLOUT_OUTPUT_DIR="${ROLLOUT_OUTPUT_DIR:-}"
 PROMPT="${PROMPT:-${FIXED_PROMPT:-}}"

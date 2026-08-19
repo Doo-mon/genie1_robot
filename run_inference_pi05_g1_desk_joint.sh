@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 启动命令：bash ./run_inference_pi05_g1_desk_joint.sh
+#
 # 通用同步 joint 推理入口，直接调用 inference_pi05_g1_desk_joint.py。
 # 服务地址、任务名、action/execution horizon、控制频率、关节限幅和夹爪阈值
 # 均由同名环境变量提供默认覆盖。WS_* 控制慢启动等待、握手/响应超时和退避；
@@ -8,7 +10,8 @@
 # 平滑轨迹、假观测和 debug 也由 0/1 环境变量转换为 CLI 开关；这些设置只作用于
 # 随后运行的 Python 子进程，不会写回父终端环境。
 # 每次运行会在 ACTION_LOG_ROOT（默认本目录/logs）建立时间戳目录并保存 console.log；
-# PLOT_ACTIONS 默认 true，退出后绘制动作对比图且不覆盖 Python 原退出码。
+# 动作 JSONL/真实 feedback 默认关闭；ACTION_LOGGING=true 时才记录，且
+# PLOT_ACTIONS 默认 true，会在退出后绘图且不覆盖 Python 原退出码。
 # set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

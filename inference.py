@@ -1074,6 +1074,7 @@ def main(args: Args):
                         robot_command,
                         episode_step=t_step + 1,
                         source=f"compat_{args.control_mode}_effective_target",
+                        environment=env,
                     )
                     t_step_time = time.perf_counter() - t0
                     

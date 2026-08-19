@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 启动命令：bash ./run_inference_pi05_g1_desk_joint_rtc.sh
+#
 # 通用异步 joint RTC 推理入口，直接调用 inference_pi05_g1_desk_joint_rtc.py。
 # 网络、任务、action horizon、RTC prefix/refill/space、频率及关节安全参数
 # 均读取同名环境变量。WS_* 控制端口转发等待、握手/响应超时和指数退避；
@@ -8,7 +10,8 @@
 # 平滑轨迹、假观测和 debug 开关以及其余变量仅供随后运行的 Python 子进程使用，
 # 正常执行本 launcher 不会改变父终端环境。
 # 每次运行会在 ACTION_LOG_ROOT（默认本目录/logs）建立时间戳目录并保存 console.log；
-# PLOT_ACTIONS 默认 true，退出后绘制动作对比图且不覆盖 Python 原退出码。
+# 动作 JSONL/真实 feedback 默认关闭；ACTION_LOGGING=true 时才记录，且
+# PLOT_ACTIONS 默认 true，会在退出后绘图且不覆盖 Python 原退出码。
 # set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

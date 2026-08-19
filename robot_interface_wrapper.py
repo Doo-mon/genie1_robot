@@ -31,6 +31,11 @@ class RobotNodeWrapper(_OriginalRobotNode):
         
         注意：此函数不包含 sleep，频率控制由调用方负责。
         """
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        if action.shape != (16,):
+            raise ValueError(f"joint command must have shape (16,), got {action.shape}")
+        if not np.all(np.isfinite(action)):
+            raise ValueError("joint command contains NaN or Inf")
         target_positions = np.concatenate((action[:7], action[8:15]))
         self.robot.move_arm(target_positions)
         self.robot.move_gripper([action[7], action[15]])

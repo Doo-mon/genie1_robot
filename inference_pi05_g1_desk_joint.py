@@ -178,6 +178,7 @@ def main(args: JointArgs) -> None:
                         raw_model_action=raw_action,
                         episode_step=step_index + 1,
                         source="joint_sync_effective_target",
+                        environment=env,
                     )
                     current_command = command
 

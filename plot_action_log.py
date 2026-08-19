@@ -3,7 +3,8 @@
 该脚本只读取已经落盘的日志，不依赖推理进程仍然存活，因此 Shell 可在正常
 退出、异常或 Ctrl-C 后统一调用。每个动作维度生成一张独立 SVG，同一张图中
 灰色点线表示服务端原始输出，红色虚线表示执行队列选中的有效模型目标，蓝色
-实线表示限幅、滞回/二值化后的实际下发命令；额外生成 ``plots/index.html``，
+实线表示限幅、滞回/二值化后提交给 SDK 的 command，绿色实线表示提交后即时
+读取的真实 hardware feedback；额外生成 ``plots/index.html``，
 以及把所有维度放进同一画布的 ``plots/overview.svg``。总览中的每个子图都有
 独立的纵轴范围，避免位置、旋转和夹爪等不同量纲互相压缩。
 
@@ -69,7 +70,12 @@ def _read_action_records(path: Path) -> tuple[list[dict[str, Any]], int]:
         try:
             record = json.loads(line)
             model = [float(value) for value in record["model_action"]]
-            actual = [float(value) for value in record["actual_action"]]
+            command = [
+                float(value)
+                for value in record.get(
+                    "command_action", record["actual_action"]
+                )
+            ]
             raw_model = [
                 float(value)
                 for value in record.get("raw_model_action", record["model_action"])
@@ -77,17 +83,30 @@ def _read_action_records(path: Path) -> tuple[list[dict[str, Any]], int]:
             elapsed = float(record["elapsed_s"])
             if (
                 len(raw_model) != len(model)
-                or len(model) != len(actual)
+                or len(model) != len(command)
                 or not model
                 or not math.isfinite(elapsed)
                 or not all(
-                    math.isfinite(value) for value in raw_model + model + actual
+                    math.isfinite(value) for value in raw_model + model + command
                 )
             ):
                 raise ValueError("invalid action row")
             record["model_action"] = model
-            record["actual_action"] = actual
+            record["command_action"] = command
+            # Keep the normalized alias so the rest of the plotter remains
+            # compatible with action-log-v1/v2 records.
+            record["actual_action"] = command
             record["raw_model_action"] = raw_model
+            feedback_value = record.get("feedback_action")
+            if feedback_value is None:
+                record["feedback_action"] = None
+            else:
+                feedback = [float(value) for value in feedback_value]
+                if len(feedback) != len(command) or not all(
+                    math.isfinite(value) for value in feedback
+                ):
+                    raise ValueError("invalid feedback row")
+                record["feedback_action"] = feedback
             record["elapsed_s"] = elapsed
             records.append(record)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -156,9 +175,11 @@ def _render_svg(
     model: list[float],
     actual: list[float],
     raw_model: list[float],
+    feedback_xs: list[float],
+    feedback: list[float],
 ) -> str:
     x_low, x_high = _scaled_range(xs)
-    y_low, y_high = _scaled_range(raw_model + model + actual)
+    y_low, y_high = _scaled_range(raw_model + model + actual + feedback)
     raw_model_points = _points(
         xs, raw_model, x_low=x_low, x_high=x_high, y_low=y_low, y_high=y_high
     )
@@ -177,6 +198,18 @@ def _render_svg(
         x_high=x_high,
         y_low=y_low,
         y_high=y_high,
+    )
+    feedback_points = (
+        _points(
+            feedback_xs,
+            feedback,
+            x_low=x_low,
+            x_high=x_high,
+            y_low=y_low,
+            y_high=y_high,
+        )
+        if feedback
+        else ""
     )
     title = html.escape(dimension_name)
     plot_width = SVG_WIDTH - LEFT - RIGHT
@@ -217,6 +250,12 @@ def _render_svg(
             f'<circle cx="{model_xy[0]}" cy="{model_xy[1]}" r="4" class="model" />'
             f'<circle cx="{actual_xy[0]}" cy="{actual_xy[1]}" r="4" class="actual" />'
         )
+    if len(feedback_xs) == 1:
+        feedback_xy = feedback_points.split()[0].split(",")
+        circles += (
+            f'<circle cx="{feedback_xy[0]}" cy="{feedback_xy[1]}" '
+            'r="4" class="feedback" />'
+        )
 
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="{SVG_WIDTH}" height="{SVG_HEIGHT}" viewBox="0 0 {SVG_WIDTH} {SVG_HEIGHT}">
@@ -227,13 +266,14 @@ def _render_svg(
     .model {{ fill: none; stroke: #d94841; stroke-width: 2; stroke-dasharray: 7 4; }}
     .raw {{ fill: none; stroke: #777f8c; stroke-width: 1.8; stroke-dasharray: 2 4; }}
     .actual {{ fill: none; stroke: #2468d8; stroke-width: 2.2; }}
+    .feedback {{ fill: none; stroke: #18864b; stroke-width: 2.0; }}
     .title {{ font: 600 19px sans-serif; fill: #202632; }}
     .label {{ font: 14px sans-serif; fill: #303744; }}
     .tick {{ font: 12px sans-serif; fill: #596273; }}
     .legend {{ font: 13px sans-serif; fill: #303744; }}
   </style>
   <rect width="100%" height="100%" class="background" />
-  <text x="{LEFT}" y="29" class="title">{title}: raw vs effective vs actual</text>
+  <text x="{LEFT}" y="29" class="title">{title}: model vs command vs feedback</text>
   {''.join(grid_lines)}
   <line x1="{LEFT}" y1="{TOP + plot_height}" x2="{LEFT + plot_width}" y2="{TOP + plot_height}" class="axis" />
   <line x1="{LEFT}" y1="{TOP}" x2="{LEFT}" y2="{TOP + plot_height}" class="axis" />
@@ -241,13 +281,16 @@ def _render_svg(
   <polyline points="{raw_model_points}" class="raw" />
   <polyline points="{model_points}" class="model" />
   <polyline points="{actual_points}" class="actual" />
+  <polyline points="{feedback_points}" class="feedback" />
   {circles}
   <line x1="{SVG_WIDTH - 445}" y1="28" x2="{SVG_WIDTH - 410}" y2="28" class="raw" />
   <text x="{SVG_WIDTH - 402}" y="33" class="legend">raw server</text>
   <line x1="{SVG_WIDTH - 300}" y1="28" x2="{SVG_WIDTH - 265}" y2="28" class="model" />
   <text x="{SVG_WIDTH - 257}" y="33" class="legend">effective target</text>
-  <line x1="{SVG_WIDTH - 120}" y1="28" x2="{SVG_WIDTH - 85}" y2="28" class="actual" />
-  <text x="{SVG_WIDTH - 77}" y="33" class="legend">actual</text>
+  <line x1="{SVG_WIDTH - 188}" y1="28" x2="{SVG_WIDTH - 153}" y2="28" class="actual" />
+  <text x="{SVG_WIDTH - 145}" y="33" class="legend">SDK command</text>
+  <line x1="{SVG_WIDTH - 54}" y1="28" x2="{SVG_WIDTH - 19}" y2="28" class="feedback" />
+  <text x="{SVG_WIDTH - 11}" y="48" class="legend" text-anchor="end">feedback</text>
   <text x="{LEFT + plot_width / 2:.2f}" y="{SVG_HEIGHT - 9}" class="label" text-anchor="middle">elapsed time (s)</text>
   <text x="18" y="{TOP + plot_height / 2:.2f}" class="label" text-anchor="middle" transform="rotate(-90 18 {TOP + plot_height / 2:.2f})">action value</text>
 </svg>
@@ -260,6 +303,8 @@ def _render_overview_svg(
     raw_models: list[list[float]],
     models: list[list[float]],
     actuals: list[list[float]],
+    feedback_xs: list[list[float]],
+    feedbacks: list[list[float]],
 ) -> str:
     """生成所有维度共用一个画布、但各自独立缩放的总览 SVG。"""
 
@@ -295,7 +340,7 @@ def _render_overview_svg(
         plot_left = panel_x + plot_left_in_panel
         plot_top = panel_y + plot_top_in_panel
         y_low, y_high = _scaled_range(
-            raw_models[index] + models[index] + actuals[index]
+            raw_models[index] + models[index] + actuals[index] + feedbacks[index]
         )
         definitions.append(
             f'<clipPath id="overview-clip-{index}">'
@@ -370,6 +415,22 @@ def _render_overview_svg(
             width=plot_width,
             height=plot_height,
         )
+        feedback_points = (
+            _points_in_rect(
+                feedback_xs[index],
+                feedbacks[index],
+                x_low=x_low,
+                x_high=x_high,
+                y_low=y_low,
+                y_high=y_high,
+                left=plot_left,
+                top=plot_top,
+                width=plot_width,
+                height=plot_height,
+            )
+            if feedbacks[index]
+            else ""
+        )
         point_markers = ""
         if len(xs) == 1:
             marker_parts: list[str] = []
@@ -384,6 +445,12 @@ def _render_overview_svg(
                     f'class="{css_class}" />'
                 )
             point_markers = "".join(marker_parts)
+        if len(feedback_xs[index]) == 1:
+            x_text, y_text = feedback_points.split(",")
+            point_markers += (
+                f'<circle cx="{x_text}" cy="{y_text}" r="3" '
+                'class="overview-feedback-point" />'
+            )
 
         panels.append(
             f'<g class="overview-panel">'
@@ -406,6 +473,8 @@ def _render_overview_svg(
             f'clip-path="url(#overview-clip-{index})" />'
             f'<polyline points="{actual_points}" class="overview-actual" '
             f'clip-path="url(#overview-clip-{index})" />'
+            f'<polyline points="{feedback_points}" class="overview-feedback" '
+            f'clip-path="url(#overview-clip-{index})" />'
             f'{point_markers}'
             f'<text x="{plot_left + plot_width / 2:.2f}" '
             f'y="{panel_y + OVERVIEW_PANEL_HEIGHT - 8:.2f}" '
@@ -424,9 +493,11 @@ def _render_overview_svg(
     .overview-raw {{ fill: none; stroke: #777f8c; stroke-width: 1.35; stroke-dasharray: 2 4; }}
     .overview-model {{ fill: none; stroke: #d94841; stroke-width: 1.55; stroke-dasharray: 7 4; }}
     .overview-actual {{ fill: none; stroke: #2468d8; stroke-width: 1.8; }}
+    .overview-feedback {{ fill: none; stroke: #18864b; stroke-width: 1.65; }}
     .overview-raw-point {{ fill: #777f8c; }}
     .overview-model-point {{ fill: #d94841; }}
     .overview-actual-point {{ fill: #2468d8; }}
+    .overview-feedback-point {{ fill: #18864b; }}
     .overview-title {{ font: 600 22px sans-serif; fill: #202632; }}
     .overview-panel-title {{ font: 600 15px sans-serif; fill: #202632; }}
     .overview-tick {{ font: 10px sans-serif; fill: #596273; }}
@@ -434,13 +505,15 @@ def _render_overview_svg(
     .overview-legend {{ font: 13px sans-serif; fill: #303744; }}
   </style>
   <rect width="100%" height="100%" class="overview-background" />
-  <text x="{OVERVIEW_OUTER_X}" y="31" class="overview-title">All action dimensions: raw vs effective vs actual</text>
+  <text x="{OVERVIEW_OUTER_X}" y="31" class="overview-title">All dimensions: model targets, SDK command, hardware feedback</text>
   <line x1="{OVERVIEW_WIDTH - 474}" y1="27" x2="{OVERVIEW_WIDTH - 439}" y2="27" class="overview-raw" />
   <text x="{OVERVIEW_WIDTH - 431}" y="32" class="overview-legend">raw server</text>
   <line x1="{OVERVIEW_WIDTH - 324}" y1="27" x2="{OVERVIEW_WIDTH - 289}" y2="27" class="overview-model" />
   <text x="{OVERVIEW_WIDTH - 281}" y="32" class="overview-legend">effective target</text>
   <line x1="{OVERVIEW_WIDTH - 137}" y1="27" x2="{OVERVIEW_WIDTH - 102}" y2="27" class="overview-actual" />
-  <text x="{OVERVIEW_WIDTH - 94}" y="32" class="overview-legend">actual</text>
+  <text x="{OVERVIEW_WIDTH - 94}" y="32" class="overview-legend">SDK command</text>
+  <line x1="{OVERVIEW_WIDTH - 137}" y1="49" x2="{OVERVIEW_WIDTH - 102}" y2="49" class="overview-feedback" />
+  <text x="{OVERVIEW_WIDTH - 94}" y="54" class="overview-legend">hardware feedback</text>
   <text x="{OVERVIEW_OUTER_X}" y="54" class="overview-axis-label">Each subplot uses its own Y-axis range.</text>
   {''.join(panels)}
 </svg>
@@ -483,18 +556,31 @@ def plot_log_directory(log_directory: Path) -> int:
     all_models: list[list[float]] = []
     all_actuals: list[list[float]] = []
     all_raw_models: list[list[float]] = []
+    all_feedback_xs: list[list[float]] = []
+    all_feedbacks: list[list[float]] = []
     for index, name in enumerate(names):
         model = [float(record["model_action"][index]) for record in records]
         actual = [float(record["actual_action"][index]) for record in records]
         raw_model = [
             float(record["raw_model_action"][index]) for record in records
         ]
+        feedback_pairs = [
+            (float(record["elapsed_s"]), float(record["feedback_action"][index]))
+            for record in records
+            if record.get("feedback_action") is not None
+        ]
+        feedback_xs = [pair[0] for pair in feedback_pairs]
+        feedback = [pair[1] for pair in feedback_pairs]
         all_models.append(model)
         all_actuals.append(actual)
         all_raw_models.append(raw_model)
+        all_feedback_xs.append(feedback_xs)
+        all_feedbacks.append(feedback)
         file_name = f"{index:02d}_{_safe_file_name(name)}.svg"
         (output / file_name).write_text(
-            _render_svg(name, xs, model, actual, raw_model),
+            _render_svg(
+                name, xs, model, actual, raw_model, feedback_xs, feedback
+            ),
             encoding="utf-8",
         )
         generated.append((name, file_name))
@@ -507,6 +593,8 @@ def plot_log_directory(log_directory: Path) -> int:
             all_raw_models,
             all_models,
             all_actuals,
+            all_feedback_xs,
+            all_feedbacks,
         ),
         encoding="utf-8",
     )
@@ -514,7 +602,7 @@ def plot_log_directory(log_directory: Path) -> int:
         f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>动作曲线总览</title>
 <style>body{{font-family:sans-serif;margin:24px;background:#f5f7fa;color:#202632}}main{{max-width:{OVERVIEW_WIDTH}px;margin:auto}}img{{display:block;width:100%;height:auto;background:white;box-shadow:0 1px 6px #ccd2dc}}a{{color:#2468d8}}</style></head>
-<body><main><h1>模型动作与实际动作总览</h1><p>每个维度使用独立纵轴；灰色为服务端原始输出，红色为有效模型目标，蓝色为实际下发动作。<a href="index.html">查看逐维大图</a></p><img src="{overview_file_name}" alt="全部动作维度总览"></main></body></html>
+<body><main><h1>模型、命令与反馈总览</h1><p>每个维度使用独立纵轴；灰色为服务端原始输出，红色为有效模型目标，蓝色为提交给 SDK 的 command，绿色为提交后即时读取的真实 feedback。<a href="index.html">查看逐维大图</a></p><img src="{overview_file_name}" alt="全部动作维度总览"></main></body></html>
 ''',
         encoding="utf-8",
     )
@@ -528,7 +616,7 @@ def plot_log_directory(log_directory: Path) -> int:
         f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>Action curves</title>
 <style>body{{font-family:sans-serif;margin:24px;background:#f5f7fa;color:#202632}}section{{background:white;padding:12px 18px;margin:0 0 20px;border-radius:8px;box-shadow:0 1px 5px #ccd2dc}}img{{width:100%;height:auto}}h1,h2{{margin:8px 0}}a{{color:#2468d8}}.overview{{border:2px solid #b9c9e9}}</style></head>
-<body><h1>模型动作与实际动作逐维对比</h1><p>成功动作数：{len(records)}；忽略的损坏/不兼容行：{ignored}；<a href="overview.html">单独打开全部维度总览</a></p><section class="overview"><h2>全部维度总览（每个子图独立纵轴）</h2><a href="overview.html"><img src="{overview_file_name}" alt="全部动作维度总览"></a></section>{cards}</body></html>
+<body><h1>模型、SDK command 与真实 feedback 逐维对比</h1><p>成功命令数：{len(records)}；忽略的损坏/不兼容行：{ignored}；<a href="overview.html">单独打开全部维度总览</a></p><section class="overview"><h2>全部维度总览（每个子图独立纵轴）</h2><a href="overview.html"><img src="{overview_file_name}" alt="全部动作维度总览"></a></section>{cards}</body></html>
 ''',
         encoding="utf-8",
     )
@@ -558,7 +646,10 @@ def plot_log_directory(log_directory: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Plot model targets and actual commands from one inference log"
+        description=(
+            "Plot model targets, SDK commands, and hardware feedback from one "
+            "inference log"
+        )
     )
     parser.add_argument("log_directory", type=Path)
     args = parser.parse_args()

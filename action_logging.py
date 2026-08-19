@@ -4,8 +4,9 @@
 ``run.json``、``policy_io.jsonl`` 与 ``actions.jsonl``。策略请求只完整保存
 数值状态、RTC prefix 和 prompt；三路图像仅记录形状与 dtype，避免日志被原始
 图像淹没。策略响应的原始 action chunk 会逐请求保存，成功执行的每一步则额外
-保存“原始服务端输出”“选中的有效模型目标”和“安全处理后实际命令”，供离线
-逐维画图。
+保存“原始服务端输出”“选中的有效模型目标”“成功提交给 SDK 的 command”和
+“提交后即时读取的真实 feedback”，供离线逐维画图。command 不是到位反馈；
+控制器是异步的，因此 feedback 也只是采样时刻的物理状态，不代表轨迹已完成。
 
 所有 JSONL 记录均逐行 flush，因此正常结束、异常和 Ctrl-C 后已经写完的行仍可
 读取；末尾偶发的不完整行由绘图器忽略。日志失败只会打印一次警告并停用日志，
@@ -29,7 +30,7 @@ from typing import Any
 import numpy as np
 
 
-LOG_SCHEMA_VERSION = "action-log-v2"
+LOG_SCHEMA_VERSION = "action-log-v3"
 LOG_DIR_ENV = "INFERENCE_ACTION_LOG_DIR"
 LOG_ENABLED_ENV = "INFERENCE_ACTION_LOG_ENABLED"
 
@@ -158,6 +159,7 @@ class ActionLogSession:
         self._action_write_total_s = 0.0
         self._action_write_max_s = 0.0
         self._performance_warning_printed = False
+        self._feedback_warning_printed = False
         enabled_value = os.environ.get(LOG_ENABLED_ENV, "true").strip().casefold()
         if enabled_value not in {"1", "true", "yes", "0", "false", "no"}:
             raise ValueError(f"{LOG_ENABLED_ENV} must be true or false")
@@ -176,8 +178,17 @@ class ActionLogSession:
                     "effective policy target selected for this execution step; "
                     "RTC freeze/hard-lock/alignment may already be applied"
                 ),
+                "command_action": (
+                    "safety-processed command accepted by env.step/SDK; this is "
+                    "not measured physical motion or proof that the target was reached"
+                ),
                 "actual_action": (
-                    "safety-processed command after successful env.step"
+                    "legacy alias of command_action retained for old plot readers"
+                ),
+                "feedback_action": (
+                    "fresh SDK state sampled immediately after command submission, "
+                    "transformed into the same 14D/16D space; an asynchronous "
+                    "instantaneous sample, not command-completion feedback"
                 ),
                 "raw_server_actions": "policy_io.jsonl policy_response records",
             },
@@ -384,8 +395,53 @@ class ActionLogSession:
         raw_model_action: Any | None = None,
         episode_step: int,
         source: str,
+        environment: Any | None = None,
+        feedback_sample: tuple[Any, int] | None = None,
     ) -> None:
-        """Append one pair only after the command was successfully applied."""
+        """Log one successful SDK command and its immediate physical feedback.
+
+        ``environment`` is deliberately optional for fake-observation runs.  A
+        real environment must expose ``get_control_feedback()`` returning
+        ``(vector, local_timestamp_ns)``.  Feedback sampling failures do not
+        erase the already submitted command and do not stop control; that row
+        is retained with ``feedback_action=null`` and one warning is printed.
+        EE RTC can pass ``feedback_sample`` from its atomic command+feedback
+        gate, avoiding a second SDK/FK read and preserving the exact gate sample.
+        """
+
+        # Do not add an SDK/FK read to the control loop when action logging was
+        # explicitly disabled or already failed.
+        with self._lock:
+            if self._closed or self._disabled:
+                return
+        logging_started = time.perf_counter()
+
+        feedback_action = None
+        feedback_timestamp_ns = None
+        feedback_kind = "simulated_command"
+        if feedback_sample is not None:
+            feedback_action, feedback_timestamp_ns = feedback_sample
+            feedback_kind = "atomic_hardware_state_after_command_submit"
+        elif environment is None:
+            feedback_action = actual_action
+            feedback_timestamp_ns = time.time_ns()
+        else:
+            feedback_kind = "hardware_state_after_command_submit"
+            try:
+                feedback_action, feedback_timestamp_ns = (
+                    environment.get_control_feedback()
+                )
+            except Exception as error:
+                feedback_kind = "hardware_feedback_unavailable"
+                with self._lock:
+                    if not self._feedback_warning_printed:
+                        self._feedback_warning_printed = True
+                        print(
+                            "[action-log] warning: the SDK command was submitted "
+                            "but physical feedback sampling failed; command is "
+                            f"still logged without feedback: {error}",
+                            file=sys.stderr,
+                        )
 
         try:
             model = np.asarray(model_action, dtype=np.float64).reshape(-1)
@@ -412,6 +468,36 @@ class ActionLogSession:
                 self._disable_locked(error)
             return
 
+        feedback = None
+        if feedback_action is not None:
+            try:
+                feedback = np.asarray(
+                    feedback_action, dtype=np.float64
+                ).reshape(-1)
+                if feedback.shape != (expected,):
+                    raise ValueError(
+                        f"expected {expected}D feedback action, got {feedback.shape}"
+                    )
+                if not np.all(np.isfinite(feedback)):
+                    raise ValueError("feedback action contains NaN or Inf")
+                if feedback_timestamp_ns is not None:
+                    feedback_timestamp_ns = int(feedback_timestamp_ns)
+                    if feedback_timestamp_ns < 0:
+                        raise ValueError("feedback timestamp must be non-negative")
+            except Exception as error:
+                feedback = None
+                feedback_timestamp_ns = None
+                feedback_kind = "hardware_feedback_unavailable"
+                with self._lock:
+                    if not self._feedback_warning_printed:
+                        self._feedback_warning_printed = True
+                        print(
+                            "[action-log] warning: invalid physical feedback was "
+                            "ignored; command logging continues: "
+                            f"{error}",
+                            file=sys.stderr,
+                        )
+
         with self._lock:
             if self._closed or self._disabled:
                 return
@@ -424,20 +510,35 @@ class ActionLogSession:
                     "source": str(source),
                     "raw_model_action": raw_model.tolist(),
                     "model_action": model.tolist(),
+                    "command_action": actual.tolist(),
+                    # Compatibility for action-log-v1/v2 plot readers.  New
+                    # code must call this a command, not a measured action.
                     "actual_action": actual.tolist(),
+                    "feedback_action": (
+                        None if feedback is None else feedback.tolist()
+                    ),
+                    "feedback_timestamp_ns": feedback_timestamp_ns,
+                    "feedback_kind": feedback_kind,
                     "safety_changed_l2": float(np.linalg.norm(actual - model)),
+                    "command_feedback_l2": (
+                        None
+                        if feedback is None
+                        else float(np.linalg.norm(actual - feedback))
+                    ),
                 }
             )
-            write_started = time.perf_counter()
             self._write_line_locked(self._action_file, record)
-            write_s = time.perf_counter() - write_started
+            # Include hardware feedback sampling, FK/packing, validation and
+            # flush—not merely disk write—when deciding whether logging is
+            # distorting the control period.
+            write_s = time.perf_counter() - logging_started
             self._action_write_count += 1
             self._action_write_total_s += write_s
             self._action_write_max_s = max(self._action_write_max_s, write_s)
             self._maybe_warn_logging_overhead_locked()
 
     def _maybe_warn_logging_overhead_locked(self) -> None:
-        """Suggest disabling logs when measured writes threaten the control loop."""
+        """Suggest disabling logs when feedback+write work threatens the loop."""
 
         if (
             self._performance_warning_printed

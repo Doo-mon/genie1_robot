@@ -233,6 +233,31 @@ def _limit_vector_delta(
     return current + delta * (float(max_norm) / norm)
 
 
+def _limit_rotation_delta(
+    target: np.ndarray,
+    current: np.ndarray,
+    max_angle: float | None,
+) -> np.ndarray:
+    """Limit one rotation-vector command along the shortest SO(3) path.
+
+    Rotation vectors are not ordinary Euclidean coordinates near the ``pi``
+    representation boundary.  Interpolating their three components directly
+    can turn a physically small orientation change into an almost full turn.
+    Use the same quaternion/SO(3) metric as retiming and physical arrival
+    checks, while preserving the policy's exact endpoint representation once
+    it is within the configured angular step.
+    """
+
+    target = np.asarray(target, dtype=np.float32).reshape(3)
+    current = np.asarray(current, dtype=np.float32).reshape(3)
+    if max_angle is None or max_angle <= 0:
+        return target.copy()
+    distance = _rotation_distance(current, target)
+    if distance <= float(max_angle) or distance < 1e-8:
+        return target.copy()
+    return _slerp_rotation_vector(current, target, float(max_angle) / distance)
+
+
 def process_ee_action(
     action: np.ndarray,
     previous_command: np.ndarray,
@@ -263,7 +288,7 @@ def process_ee_action(
             result[part], previous[part], max_position_delta
         )
     for part in (LEFT_ROTATION, RIGHT_ROTATION):
-        result[part] = _limit_vector_delta(
+        result[part] = _limit_rotation_delta(
             result[part], previous[part], max_rotation_delta
         )
 
@@ -363,6 +388,12 @@ def _rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
     second_q = _rotvec_to_quaternion(second)
     cosine_half = float(np.clip(abs(np.dot(first_q, second_q)), 0.0, 1.0))
     return float(2.0 * np.arccos(cosine_half))
+
+
+def rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
+    """Public shortest SO(3) angle used by feedback-based RTC arrival checks."""
+
+    return _rotation_distance(first, second)
 
 
 def _slerp_rotation_vector(

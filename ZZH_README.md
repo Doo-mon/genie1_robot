@@ -47,10 +47,10 @@
 | `inference_pi05_g1_desk_{ee,joint}_rollout_rtc.py` | RTC 执行并可录制 rollout。 |
 | `inference.py` | 兼容 bread/旧 18D、20D 控制链路；也使用同一 WebSocket 工厂，但不要把它的维度定义混入 desk EE/joint 合同。 |
 | `robot_env.py` | Gym 风格真实机器人封装；`reset()` 可能运动，`step()` 下发命令，`get_obs()` 读取三路图像和状态，并以统一锁串行化硬件访问。 |
-| `robot_interface.py` | a2d_sdk 底层接口。构造时等待 head 图像、14D 手臂和双夹爪数据；等待过久只告警，不自动退出。 |
+| `robot_interface.py` | a2d_sdk 底层接口。构造时等待 head/左腕/右腕三路图像、14D 手臂和双夹爪数据；等待过久只告警，不自动退出。 |
 | `env_for_g1.sh` | 激活机器人 SDK/conda 环境并进入工作区；应使用 `source`。 |
 
-活跃的 9 个 Shell launcher：
+活跃的 11 个 Shell launcher：
 
 | launcher | 模式 | prompt profile / 默认 key | 默认本地端口 |
 |---|---|---|---:|
@@ -70,15 +70,16 @@
 
 ### 1.1 每次运行的输入/动作日志与自动绘图
 
-九个 launcher 最终都会经过同一套日志入口。每次启动立即在默认的
-`./logs/` 下创建一个独立目录：
+十一个 launcher 最终都会经过同一套日志入口。Shell 默认关闭动作/策略 JSONL
+和真实 feedback 读取，只在默认的 `./logs/` 时间戳目录保存 `console.log`，避免
+诊断读取占用20/30Hz控制周期。显式设置 `ACTION_LOGGING=true` 后目录内容为：
 
 ```text
 logs/YYYYMMDD_HHMMSS_<python入口>_pid<PID>/
 ├── console.log          # 终端 stdout/stderr
 ├── run.json             # 模式、维度名、参数、开始/结束时间
 ├── policy_io.jsonl      # 数值输入、RTC prefix、prompt、原始模型响应
-├── actions.jsonl        # 原始模型输出、有效目标与实际命令
+├── actions.jsonl        # 原始/有效目标、SDK command 与即时硬件 feedback
 └── plots/
     ├── overview.svg     # 所有维度汇总在同一画布，每个子图独立纵轴
     ├── overview.html    # 单独打开总览
@@ -89,24 +90,35 @@ logs/YYYYMMDD_HHMMSS_<python入口>_pid<PID>/
 EE 日志固定 14 维，joint 日志固定 16 维
 `[left_arm7,left_hand,right_arm7,right_hand]`。`actions.jsonl` 只在
 `env.step()` 成功（fake 模式则在等价执行点）后追加，所以未真正下发的目标不会
-伪装成实际动作。逐维图和总览中的每个子图都包含原始服务端输出、完成
-freeze/prefix hard-lock/时间对齐后的有效目标，以及实际命令三条曲线；总览的
+伪装成实际动作。新日志明确区分 `command_action`（SDK 已接受的命令）与
+`feedback_action`（命令提交后从 SDK 即时读取并转换到同一 14D/16D 空间的物理
+反馈）；旧字段 `actual_action` 仅作为 `command_action` 的兼容别名，不是传感器
+实测值。逐维图和总览中的每个子图都包含原始服务端输出、完成
+freeze/prefix hard-lock/时间对齐后的有效目标、SDK command 和 hardware feedback；总览的
 各维度使用独立纵轴，避免夹爪、位置和旋转的量纲互相压缩。原始 action chunk
 也完整保存在 `policy_io.jsonl`。
 
-默认在 Python 正常退出、报错退出或 Ctrl-C 最终结束进程后自动读取已经 flush 的
+反馈采样发生在 command 提交返回之后。SDK 的运动接口是异步的，所以这条绿色
+feedback 曲线表示“此刻机器人在哪里”，不表示“该 command 已经执行完成”。EE
+feedback 由同一份 fresh joint16 经 FK/retargeter 得到，joint feedback 直接使用
+fresh joint16；两种模式都把 0--120 的夹爪 state 归一化为命令侧 0--1 后再比较。
+`feedback_timestamp_ns` 是本机采样完成时间，不是控制器的轨迹完成时间。采样失败
+时 command 行仍保留，`feedback_action` 为 `null`，终端只打印一次 warning。
+
+启用动作日志后，Python 正常退出、报错退出或 Ctrl-C 最终结束进程时会自动读取已经 flush 的
 `actions.jsonl` 绘图。日志没有任何成功动作时会明确跳过，不生成空图；绘图失败
 也不会覆盖 Python 原退出码。开关和目录均用单次命令变量，不会注册到父终端：
 
 ```bash
-# 默认自动绘图
-PLOT_ACTIONS=true bash ./run_inference_pi05_g1_desk_joint_rtc.sh
+# 临时启用动作日志；PLOT_ACTIONS 默认 true，因此退出后自动绘图
+ACTION_LOGGING=true bash ./run_inference_pi05_g1_desk_joint_rtc.sh
 
 # 只记日志，不在退出时绘图
-PLOT_ACTIONS=false bash ./run_inference_pi05_g1_desk_ee_rtc.sh
+ACTION_LOGGING=true PLOT_ACTIONS=false \
+  bash ./run_inference_pi05_g1_desk_ee_rtc.sh
 
-# 完全关闭动作/策略 JSONL（仍保存 console.log，也自动跳过绘图）
-ACTION_LOGGING=false bash ./run_inference_pi05_g1_desk_ee_rtc.sh
+# 默认状态：不写动作/策略 JSONL，只保留 console.log
+bash ./run_inference_pi05_g1_desk_ee_rtc.sh
 
 # 修改日志根目录
 ACTION_LOG_ROOT=/data/g1_inference_logs \
@@ -120,9 +132,10 @@ python ./plot_action_log.py ./logs/<本次时间戳目录>
 `SIGKILL`、掉电和系统崩溃无法执行 Shell EXIT trap，但此前已经完整 flush 的
 JSONL 行仍可在恢复后手动绘制。
 
-动作日志会测量每次 JSON 序列化、写盘和 flush 的实际耗时。记录至少 30 步后，
+显式启用后，动作日志会测量每次真实 feedback 读取/FK、JSON 序列化、写盘和 flush 的总耗时。记录至少 30 步后，
 若平均耗时达到控制周期的10%，或单次峰值达到25%，终端会提示下次用
-`ACTION_LOGGING=false` 关闭，避免日志明显侵占20/30Hz控制周期。
+`ACTION_LOGGING=false` 关闭，避免日志明显侵占20/30Hz控制周期。Shell 已默认使用
+这个安全设置；只有诊断运行才建议临时设为 `true`。
 
 提示只是一项基于真机当前磁盘性能的建议，不会在运行中自动关闭日志或改变动作
 执行。需要关闭时应先正常结束当前进程，再在下一次启动命令前设置开关。直接运行
@@ -153,7 +166,7 @@ EE14 的固定顺序为：
  R_xyz3, R_axis_angle3, R_hand1]
 ```
 
-夹爪在 state 与 action 中使用不同数值空间：机器人反馈 state 是 0--120 的编码器位置，模型 action 是连续 0--1；当前训练数据约定二者同方向变化，`0=张开、1/120=闭合`。模型响应 `actions` 必须是有限值 `H x 14`。下发前会按左右臂分别限制位置和轴角的单步变化。通用 Shell 默认开启夹爪二值化，并使用双阈值滞回：action 从张开状态上升到 `0.90` 才闭合，从闭合状态下降到 `0.10` 才张开，中间区间保持上次命令；这样不会像单阈值那样在中间值附近提前切换或抖动。设置 `BINARIZE_GRIPPER=false` 可原样保留连续 action。启用 `freeze_left_arm` 时，完整左侧 7D EE 目标固定为 episode 起点，其中夹爪 state 会先除以 120 转换到 action 空间，避免把 0--120 state 写进动作队列。
+夹爪在 state 与 action 中使用不同数值空间：机器人反馈 state 是 0--120 的编码器位置，模型 action 是连续 0--1；当前训练数据约定二者同方向变化，`0=张开、1/120=闭合`。模型响应 `actions` 必须是有限值 `H x 14`。下发前会按左右臂分别限制位置和轴角的单步变化。所有活跃 EE Shell 默认开启夹爪二值化，并统一使用双阈值滞回：action 从张开状态上升到 `0.90` 才闭合，从闭合状态下降到 `0.50` 才张开，中间区间保持上次命令。设置 `BINARIZE_GRIPPER=false` 可原样保留连续 action；需要更晚松爪时仍可在单次命令中显式降低 `GRIPPER_OPEN_THRESHOLD`。启用 `freeze_left_arm` 时，完整左侧 7D EE 目标固定为 episode 起点，其中夹爪 state 会先除以 120 转换到 action 空间，避免把 0--120 state 写进动作队列。
 
 EE rollout 与线上命令维度不同：
 
@@ -309,7 +322,8 @@ ROLLOUT_OUTPUT_DIR='./rollout_datasets/5659_sync_verified_run' \
 bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50.sh
 ```
 
-该 preset 默认 `ROLLOUT_ENABLED=true`。只关闭 rollout，但保留动作日志和退出画图：
+该 preset 默认 `ROLLOUT_ENABLED=true`，动作 JSONL 和退出画图仍遵循 Shell
+的默认设置（关闭）。只关闭 rollout：
 
 ```bash
 ROLLOUT_ENABLED=false \
@@ -345,7 +359,7 @@ FREEZE_ARM=left \
   bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm_rollout_rtc.sh
 ```
 
-RTC 对服务端响应先应用同一侧 EE7 冻结，再生成 committed prefix 和 hard-lock，因此模型时间线、实际 EE 命令与硬件侧 `ABS_POSE` 冻结保持一致。RTC 不使用同步版的整块可变长度重采样：服务端 prefix 仍按原始模型 timestep 对齐，未冻结手臂继续使用每 tick 位置/旋转限幅。二值夹爪发生切换时是唯一例外：如果对应手臂因为限幅尚未到达该模型 row 的绝对 EE 位姿，RTC 会把这一行保留在队首，保持旧夹爪并逐 tick 继续靠近；到达终点的命令先单独下发并保留旧夹爪，经过一个完整控制周期后，下一 tick 才切换夹爪、弹出该行并增加模型时间线的 pop count。门控默认最多持续 2 秒，超时会保持旧夹爪并终止本 episode，而不会为了继续运行强制抓取或释放。
+RTC 对服务端响应先应用同一侧 EE7 冻结，再生成 committed prefix 和 hard-lock，因此模型时间线、实际 EE 命令与硬件侧 `ABS_POSE` 冻结保持一致。RTC 不使用同步版的整块可变长度重采样：服务端 prefix 仍按原始模型 timestep 对齐，未冻结手臂继续使用每 tick 位置/旋转限幅。位置按欧氏距离推进，旋转使用 quaternion SLERP 的 SO(3) 最短路径，不会在轴角正负 pi 边界绕远路。二值夹爪发生切换时是唯一例外：RTC 把该模型行留在队首并保持旧夹爪，通过 `RobotEnv.step_with_control_feedback()` 在同一硬件锁内下发手臂命令并读取 fresh EE14 feedback。对应手臂的位置误差默认需小于 5 mm、最短 SO(3) 旋转误差小于 0.05 rad，并连续满足 3 帧；之后才在下一 tick 切换夹爪，同时保持 EE 目标 0.20 秒。以上阶段全部完成后才弹出这一行、增加一次模型时间线 pop count，并默认丢弃抓取/释放前预测的旧 tail、用新观测请求 fresh chunk。门控先按当前距离、位置/旋转单步限制和频率估算理想推进时间，再加入 SDK 轨迹、稳定帧、夹爪保持及至少 1 秒/50% 跟踪余量；总超时至少 5 秒、最多 30 秒。理论所需时间超过30秒时会在建立门控时直接拒绝，避免对异常目标无限等待。若 `max_timesteps` 在门控中耗尽，episode 会明确失败而非标记 completed。同步 EE 不调用这套状态机。
 
 需要 literal prompt 时可设置 `PROMPT='完整文本'`。通用同步 EE launcher 的 rollout 默认关闭，可用 `ROLLOUT_ENABLED=true`开启；通用 RTC-rollout launcher 也可用 `ROLLOUT_ENABLED=0` 关闭。`ROLLOUT_FPS` 设置采集频率，`ROLLOUT_OUTPUT_DIR` 指定数据集根目录。
 
@@ -461,7 +475,7 @@ observation dict
 
 `execution_horizon` 统计采用的模型 row；`max_timesteps` 统计重采样后成功下发的 command。单 chunk 超过 `MAX_RETIMED_CHUNK_STEPS` 会在第一条真机命令之前整体拒绝，不会截断 endpoint 或夹爪事件。终端每个 chunk 打印 `model_rows -> commands`、最大 segment 展开倍数和预计执行时间；展开过大时应减少 `EXECUTION_HORIZON`或重新评估限幅，不应只把安全上限抬高。
 
-重采样模式不会在 chunk 边界改用滞后的反馈重置 command 基线，因此这些上限连续约束相邻成功下发 EE target command（包括两个 chunk 之间）；`actions.jsonl` 中的 `actual_action` 也是这个命令，不是传感器实测位移。策略请求仍使用每次新读取的观测。真实机械臂还受 SDK 轨迹控制、`TRAJECTORY_TIME`、跟踪误差和反馈频率影响；rollout state 才是观测反馈。
+重采样模式不会在 chunk 边界改用滞后的反馈重置 command 基线，因此这些上限连续约束相邻成功下发 EE target command（包括两个 chunk 之间）；`actions.jsonl` 中的 `command_action`（及旧别名 `actual_action`）是这个命令，绿色 `feedback_action` 才是提交后的即时传感器/FK反馈。策略请求仍使用每次新读取的观测。真实机械臂还受 SDK 轨迹控制、`TRAJECTORY_TIME`、跟踪误差和反馈频率影响；feedback/rollout state 才可用于观察跟踪情况。
 
 RTC 第一个请求没有 prefix。后续请求携带：
 
@@ -470,20 +484,22 @@ remaining_action_chunk
 prefix_len
 ```
 
-响应返回时，运行时先在完整响应上把承诺前缀硬锁回原命令，再丢弃推理期间已经执行所对应的行，避免近似模型输出改变已经承诺的轨迹。EE 与 joint 都会从最近实际下发命令开始，顺序模拟位置/旋转或关节限幅及夹爪处理后的真实承诺命令，再把该命令序列发送给服务端并用于硬锁；EE 模拟遇到需要等待手臂的夹爪切换行时，会在该行之前截断 committed prefix，因为这一行尚不再满足“一模型 row 对应一物理 tick”。门控过程中虽然手臂命令继续推进，但 `_pop_count` 不增加；timeline revision 会拒绝恰好跨越门控返回的旧响应，门控结束后再用新观测和剩余队列发起请求。`rtc_prefix_space=openpi` 和 `robot` 目前都是统一 joint16 顺序，仅为旧启动配置保留名称。EE 的 prefix 夹爪固定使用模型 action 的 `0-1` 空间；`0-120` 只属于机器人反馈 state，不能作为服务端 RTC action prefix。该合同不再通过 Shell 或 CLI 暴露切换参数。原始目标队列保留模型输出；committed prefix、hard-lock、机器人命令和 rollout action 也始终处于 0--1 动作空间。通用 Shell 默认用滞回阈值把实际承诺/执行命令处理成端点，关闭二值化后则保持连续值。EE 或 joint 响应若晚到且执行进度已经超过本次 `prefix_len`，运行时不会接入这段缺少完整承诺历史的结果，而是保留当前队列并发起新请求。
+响应返回时，运行时先在完整响应上把承诺前缀硬锁回原命令，再丢弃推理期间已经执行所对应的行，避免近似模型输出改变已经承诺的轨迹。EE 与 joint 都会从最近实际下发命令开始，顺序模拟位置/旋转或关节限幅及夹爪处理后的真实承诺命令，再把该命令序列发送给服务端并用于硬锁；EE committed 模拟在任何二值夹爪切换行之前停止，因为真实反馈门控具有可变时长，不再满足“一模型 row 对应一物理 tick”。门控过程中手臂 command 可以继续推进，但 `_pop_count` 不增加；timeline revision 会拒绝跨越门控返回的旧响应，门控结束后默认重新观测并推理。`rtc_prefix_space=openpi` 和 `robot` 目前都是统一 joint16 顺序，仅为旧启动配置保留名称。EE 的 prefix 夹爪固定使用模型 action 的 `0-1` 空间；`0-120` 只属于机器人反馈 state，不能作为服务端 RTC action prefix。该合同不再通过 Shell 或 CLI 暴露切换参数。原始目标队列保留模型输出；committed prefix、hard-lock、机器人命令和 rollout action 也始终处于 0--1 动作空间。通用 Shell 默认用滞回阈值把实际承诺/执行命令处理成端点，关闭二值化后则保持连续值；真实反馈门控只在“启用二值化且启用同步”时生效。EE 或 joint 响应若晚到且执行进度已经超过本次 `prefix_len`，运行时不会接入这段缺少完整承诺历史的结果，而是保留当前队列并发起新请求。
 
-两个 H50 EE rollout preset 当前默认使用 `RTC_PREFIX_LEN=34`、
-`RTC_REFILL_AT=40`。在 30 Hz 下，34 步约为 1.13 秒，用于覆盖本机一次真机
-测试中约 1.09 秒的最大推理延迟；旧的 8 步仅约 0.27 秒，会让多数响应越过
-承诺前缀而被拒绝。该默认只属于 H50 preset，不能照搬到默认 H20 的通用入口。
-34/40 能显著减少迟到拒绝，但连续多次接近最坏延迟时 H50 仍可能短暂耗尽；
+3017/3040 H50 preset 默认使用 `RTC_PREFIX_LEN=34`、`RTC_REFILL_AT=40`；
+5659 H50 preset 当前使用 `RTC_PREFIX_LEN=24`、`RTC_REFILL_AT=34`。在 30 Hz 下，
+24 步约为 0.80 秒，34 步约为 1.13 秒。5659 的 24/34 配置保留了更多自由
+规划步，但遇到此前约 1.09 秒的最大推理延迟时仍可能拒绝响应；3017/3040 的
+34/40 更保守。旧的 8 步仅约 0.27 秒，会让多数慢响应越过承诺前缀而被拒绝。
+这些默认只属于 H50 preset，不能照搬到默认 H20 的通用入口。连续多次接近
+最坏延迟时 H50 仍可能短暂耗尽；
 应继续观察 `infer_ms`、handoff reject 和 queue starvation，而不是把该配置理解为
 无条件的实时保证。
 
 Shell 示例（均为单次命令变量，不会写入父终端环境）：
 
 ```bash
-# 默认：prefix 使用0--1；夹爪以 close=0.90/open=0.10 双阈值切换
+# 默认：prefix 使用0--1；夹爪以 close=0.90/open=0.50 双阈值切换
 bash run_inference_pi05_g1_desk_ee_rtc.sh
 
 # 更晚闭合、也更晚张开（1=闭合，0=张开）
@@ -556,10 +572,11 @@ Use this prompt and start execution?
 真实模式创建 `RobotEnv` 时，底层默认认为 SDK 的状态接口符合当前合同，并等待：
 
 ```text
-head_camera + arm_joint_states + gripper_states
+head_camera + hand_left_camera + hand_right_camera
++ arm_joint_states + gripper_states
 ```
 
-正常情况下三项会很快到达，不产生额外输出。若等待超过 5 秒，终端打印第一次
+正常情况下这些数据会很快到达，不产生额外输出。若等待超过 5 秒，终端打印第一次
 `[RobotNode] warning`，列出仍为 `None` 的通道；之后每 10 秒重复一次。该告警
 不会自动终止初始化，也不会绕过缺失数据开始执行，程序仍继续等待。现场确认只是
 模型或 DDS 启动较慢时可以继续观察；确认相机、DDS 或 SDK 异常时按 Ctrl-C 退出，
@@ -567,6 +584,40 @@ head_camera + arm_joint_states + gripper_states
 
 当前代码按已确认的 SDK 合同使用 14D 手臂序列和双夹爪序列，并组合成
 `[L7,Lhand,R7,Rhand]` 16D，不额外猜测或重排 SDK 返回格式。
+
+### 7.2 Servo 模式与 motion error 检查
+
+真实 EE 第一次下发前会读取 `RobotController.get_motion_status()`；没有错误时，
+若控制器尚未处于 `mode.value=1`，客户端显式调用
+`set_motion_control_mode(1)` 并等待最多 5 秒确认 Servo。只在本次运行尚未确认
+Servo 时允许这次自动切换。一旦执行已经开始，若后续状态变为 STOP(0) 或
+PLANNING(2)，客户端不会自动清除现场急停/模式变化，而是请求
+`set_motion_stop()` 并终止 episode。
+
+EE command 在 SDK 调用前后都检查 motion status；joint command 也在下发前后
+检查，Ruckig 长轨迹中每 10 个插值点额外检查一次。检查条件为：
+
+```text
+status 必须是 dict
+status.mode.value 必须存在
+status.error 必须是 dict
+status.error.has_error == false
+status.error.code == 0
+EE 执行期间还要求 status.mode.value == 1 (Servo)
+```
+
+任一条件失败都会停止继续下发，最佳努力调用 `set_motion_stop()`，并抛出包含
+`code/message/mode` 的 `MotionControlError`（状态结构或读取失败则为
+`RuntimeError`）。由于 SDK 轨迹执行是异步的，command 返回后稍晚才出现的错误
+会在下一次 command 的前置检查中发现；当前实现不是独立高频安全 PLC，也不能
+替代实体急停。
+
+产品手册给出的手臂系统错误码包括：`0x1001` 关节通信、`0x1002` 目标角超限、
+`0x1003` 不可达/奇异点、`0x1004` 实时核通信、`0x1005` 关节总线、`0x1006`
+规划核、`0x1007` 超速、`0x1008` 末端板连接、`0x1009` 速度限制、`0x100A`
+加速度限制。SDK 还提供 `whole_body_status` 的分部件 error/急停字段；当前推理
+主链以 `get_motion_status().error` 为统一 fail-fast 来源，现场仍应结合整机状态页、
+SDK 日志和实体急停判断故障，不能仅依赖 Python 异常。
 
 ## 8. 正常关闭顺序
 
@@ -576,7 +627,8 @@ head_camera + arm_joint_states + gripper_states
 2. 若入口询问是否继续 task，选择 `n` 退出进程。
 3. rollout 入口先 `end_episode()`：原子关闭新帧入队闸门，再停止采样、清空 writer 队列、释放视频 writer、写 Parquet/metadata；即使此步报错，外层 `finally` 仍会继续关闭 policy 和 RobotEnv。
 4. 入口调用 `policy.close()`：永久关闭 WebSocket，并唤醒所有退避等待。
-5. 最后调用 `env.close()` 关闭机器人接口。
+5. 最后调用 `env.close()`；底层会同时调用 `RobotDds.shutdown()` 和
+   `CosineCamera.close()`，分别释放 DDS 与三路相机连接。重复调用关闭接口为幂等操作。
 6. 确认本地 Python 已退出后，再终止 SSH 隧道。
 7. 确认没有其他客户端需要服务后，最后停止远端模型 server。
 
@@ -617,6 +669,13 @@ head_camera + arm_joint_states + gripper_states
 - shape/NaN 错误：核对 EE 的 `[joint16, ee14]` / EE14，或 joint 的 `[L7,Lhand,R7,Rhand]`，以及三路相机 key。
 - RTC 显示 queue starved：系统在保持最后命令，不代表已经回到安全姿态；检查推理延迟、horizon、`rtc_refill_at` 和网络日志。
 - EE/joint RTC 显示 `Rejecting ... RTC response beyond committed prefix`：推理耗时已经超过本次锁定前缀，结果为避免错接时间线而被丢弃；若持续出现，应检查推理/网络延迟，并联合调整 `rtc_prefix_len`、`rtc_refill_at` 与 horizon。
+- `motion controller error`：记录完整 `code/message/mode`，机器人已经收到最佳努力
+  STOP 请求且当前 episode 会失败；不要修改代码吞掉异常或立即重启。先确认实体
+  急停/碰撞、限位、奇异点、超速/加速度、关节总线和末端板，再由现场人员按 SDK
+  流程清错。运行中突然离开 Servo 也按故障处理，不会自动切回 Servo。
+- command 曲线正常但 feedback 明显滞后/偏离：蓝线只是 SDK command，绿线才是
+  命令提交后的即时物理反馈。先检查 `trajectory_time`、控制频率、标定/FK和运动
+  error；不要把 `env.step()` 返回误认为已经到位。
 - control overrun：降低控制/rollout 压力，检查 `trajectory_time`、相机读取和 CPU；不要通过放宽动作限幅来解决性能问题。若同时出现 action-log 耗时 warning，下次运行先用 `ACTION_LOGGING=false` 对照验证。
 - rollout 缺依赖：安装 OpenCV/PyArrow，或用 `--no-rollout-enabled`；检查输出盘空间、视频 codec 和 dropped/capture error 日志。
 - 数据集 state/action 维度不匹配时不要继续追加到已有目录；EE/joint 或不同 processing mode 不能混写同一个 rollout root。
@@ -638,6 +697,10 @@ head_camera + arm_joint_states + gripper_states
 - [ ] 真机使用有限的 response 等待；若显式启用重发，再限制 reconnect 等待。出现 queue starvation、隧道断开或异常动作时立即停止。
 - [ ] 已逐字阅读终端打印的 prompt；只有场景、左右臂、物体和目标位置都正确时才输入 `y/yes`。
 - [ ] 已知确认之后 `RobotEnv.reset()` 就可能立即运动，确认前让机器人周围人员撤离。
+- [ ] 首条 EE 命令前终端已打印 Servo mode confirmed；若运行中出现 mode/error/STOP
+  日志，按真实故障处理，不用自动重试掩盖。
+- [ ] 已理解 action log 的蓝线是 command、绿线是提交后即时 feedback；异步 SDK
+  feedback 不等于轨迹完成，Python 检查不能替代实体急停。
 - [ ] rollout 模式已确认目录、磁盘空间、fps 和依赖；录制故障不能阻塞或替代真机安全观察。
 - [ ] 已观察当前磁盘下的 action-log 耗时；若程序建议关闭，下一次时序敏感运行使用 `ACTION_LOGGING=false`，同时保留 `console.log` 和 RTC overrun 观察。
 - [ ] 已规划关闭顺序：Ctrl-C -> 结束 episode/录制 -> WebSocket -> RobotEnv -> SSH 隧道 -> 远端 server。

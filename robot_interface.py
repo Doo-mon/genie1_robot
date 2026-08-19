@@ -12,12 +12,42 @@ import time
 import numpy as np
 
 
-def _is_number(x):
+MOTION_MODE_STOP = 0
+MOTION_MODE_SERVO = 1
+MOTION_MODE_PLANNING = 2
+
+
+class MotionControlError(RuntimeError):
+    """Raised when the SDK motion controller reports a non-zero error."""
+
+    def __init__(self, *, code, message, mode, status):
+        self.code = code
+        self.message = str(message or "")
+        self.mode = mode
+        self.status = status
+        super().__init__(
+            "motion controller error: "
+            f"code={self.code}, message={self.message!r}, mode={self.mode}"
+        )
+
+
+def _as_finite_vector(value, *, length: int, name: str) -> np.ndarray:
+    """Normalize one SDK vector returned as list, tuple, or NumPy array."""
+
+    if value is None:
+        raise ValueError(f"{name} is None")
     try:
-        float(x)
-        return True
-    except Exception:
-        return False
+        vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} cannot be converted to a numeric vector") from error
+    if vector.shape != (length,):
+        raise ValueError(
+            f"{name} must contain {length} values, got shape {vector.shape}"
+        )
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} contains NaN or Inf")
+    return vector
+
 
 class RobotNode:
     """
@@ -34,15 +64,31 @@ class RobotNode:
                 "before constructing the real-robot interface."
             ) from error
 
+        self._camera_names = ("head", "hand_left", "hand_right")
         self.robot   = RobotDds()
-        self.camera  = CosineCamera(["head", "hand_left", "hand_right"])
+        self.camera  = CosineCamera(list(self._camera_names))
         self.robot_controller = RobotController()
         self.period  = 1.0 / hz
         self._t0     = time.time()
         self._smooth_command_count = 0
+        self._robot_closed = False
+        self._camera_closed = False
+        self._servo_mode_confirmed = False
 
-        # 先等底层数据就绪
-        self._wait_until_ready()
+        # 先等底层数据就绪。如果构造期间被中断，也要释放已创建的
+        # DDS 与相机资源，避免半构造对象遗留后台连接。
+        try:
+            self._wait_until_ready()
+        except BaseException:
+            try:
+                self.shutdown()
+            except Exception as cleanup_error:
+                print(
+                    "[RobotNode] warning: cleanup after initialization failure "
+                    f"also failed: {cleanup_error}",
+                    flush=True,
+                )
+            raise
 
     # -------------------------------------
     def _wait_until_ready(self):
@@ -56,16 +102,25 @@ class RobotNode:
         started = time.monotonic()
         next_warning = started + 5.0
         while True:
-            img, _ = self.camera.get_latest_image("head")
+            images = {
+                name: self.camera.get_latest_image(name)[0]
+                for name in self._camera_names
+            }
             pos, _ = self.robot.arm_joint_states()
             grip, _ = self.robot.gripper_states()
-            if img is not None and pos is not None and grip is not None:
+            if (
+                all(image is not None for image in images.values())
+                and pos is not None
+                and grip is not None
+            ):
                 break
             now = time.monotonic()
             if now >= next_warning:
-                missing = []
-                if img is None:
-                    missing.append("head_camera")
+                missing = [
+                    f"{name}_camera"
+                    for name, image in images.items()
+                    if image is None
+                ]
                 if pos is None:
                     missing.append("arm_joint_states")
                 if grip is None:
@@ -87,24 +142,151 @@ class RobotNode:
         while time.time() < deadline:
             vals, _ = getter()
             last_vals = vals
-            # 获取长度
             try:
-                actual_len = len(vals)
-            except Exception:
-                actual_len = None
-
-            # 判断每个元素是否可转 float
-            all_numeric = (actual_len == length) and all(
-                _is_number(v) for v in vals
-            )
-            if all_numeric:
+                vector = _as_finite_vector(vals, length=length, name=name)
+            except ValueError:
+                vector = None
+            if vector is not None:
                 if verbose:
                     print(f"✅ {name} 就绪")
-                return list(vals)
+                return vector.tolist()
 
             time.sleep(interval)
 
         raise RuntimeError(f"{name} 在 {timeout}s 内未就绪，最后 vals={last_vals!r}")
+
+    def _validated_motion_status(self):
+        """Return one valid, error-free SDK motion status dictionary."""
+
+        try:
+            status = self.robot_controller.get_motion_status()
+        except Exception as error:
+            self._request_motion_stop(
+                "get_motion_status raised " f"{type(error).__name__}: {error}"
+            )
+            raise RuntimeError(
+                "failed to read motion controller status; motion STOP was requested"
+            ) from error
+        if status is None:
+            self._request_motion_stop("get_motion_status returned None")
+            raise RuntimeError("motion controller status is unavailable")
+        if not isinstance(status, dict):
+            self._request_motion_stop("get_motion_status returned a non-dict value")
+            raise RuntimeError(
+                "motion controller status must be a dict, got "
+                f"{type(status).__name__}"
+            )
+
+        mode = status.get("mode")
+        error = status.get("error")
+        if not isinstance(mode, dict) or "value" not in mode:
+            self._request_motion_stop("motion status has no valid mode")
+            raise RuntimeError(f"motion controller status has invalid mode: {mode!r}")
+        if not isinstance(error, dict):
+            self._request_motion_stop("motion status has no valid error field")
+            raise RuntimeError(f"motion controller status has invalid error: {error!r}")
+
+        mode_value = mode.get("value")
+        error_code = error.get("code", 0)
+        has_error = bool(error.get("has_error", False))
+        try:
+            error_code_nonzero = int(error_code) != 0
+        except (TypeError, ValueError):
+            error_code_nonzero = error_code not in (None, "", 0, False)
+        if has_error or error_code_nonzero:
+            self._request_motion_stop(
+                f"motion error code={error_code}, "
+                f"message={error.get('message', '')!r}"
+            )
+            raise MotionControlError(
+                code=error_code,
+                message=error.get("message", ""),
+                mode=mode_value,
+                status=status,
+            )
+        return status
+
+    def _request_motion_stop(self, reason: str) -> None:
+        """Best-effort STOP used only after an invalid/error motion status."""
+
+        try:
+            self.robot_controller.set_motion_stop()
+        except Exception as stop_error:
+            print(
+                "[RobotNode] warning: motion status is unsafe and the SDK "
+                f"STOP request also failed ({reason}): {stop_error}",
+                flush=True,
+            )
+        else:
+            print(
+                "[RobotNode] unsafe motion status detected; requested motion "
+                f"STOP ({reason})",
+                flush=True,
+            )
+
+    def ensure_servo_mode(self, timeout: float = 5.0, interval: float = 0.05):
+        """Enter Servo once, then reject any unexpected later mode change.
+
+        The first EE command explicitly requests Servo mode and waits for the
+        controller to report mode=1.  After that confirmation, STOP or PLANNING
+        is never cleared automatically: it may represent an operator stop or a
+        fault and therefore requires an explicit restart/recovery decision.
+        """
+
+        if timeout <= 0 or interval <= 0:
+            raise ValueError("Servo confirmation timeout/interval must be positive")
+
+        status = self._validated_motion_status()
+        current_mode = status["mode"]["value"]
+        if getattr(self, "_servo_mode_confirmed", False):
+            if current_mode != MOTION_MODE_SERVO:
+                self._request_motion_stop(
+                    "motion controller left Servo mode after execution started: "
+                    f"mode={current_mode}"
+                )
+                raise RuntimeError(
+                    "motion controller left Servo mode after execution started: "
+                    f"mode={current_mode}; refusing to clear STOP/PLANNING automatically"
+                )
+            return status
+
+        if current_mode != MOTION_MODE_SERVO:
+            print(
+                "[RobotNode] requesting motion controller Servo mode (mode=1); "
+                f"current_mode={current_mode}",
+                flush=True,
+            )
+            self.robot_controller.set_motion_control_mode(MOTION_MODE_SERVO)
+
+        deadline = time.monotonic() + timeout
+        last_status = status
+        while True:
+            last_status = self._validated_motion_status()
+            if last_status["mode"]["value"] == MOTION_MODE_SERVO:
+                self._servo_mode_confirmed = True
+                print("[RobotNode] motion controller Servo mode confirmed", flush=True)
+                return last_status
+            if time.monotonic() >= deadline:
+                self._request_motion_stop(
+                    "Servo mode confirmation timed out: "
+                    f"last_mode={last_status['mode']['value']}"
+                )
+                raise RuntimeError(
+                    "motion controller did not enter Servo mode within "
+                    f"{timeout:.1f}s; last_mode={last_status['mode']['value']}"
+                )
+            time.sleep(interval)
+
+    def check_motion_status(self, *, require_servo: bool = False):
+        """Fail fast on SDK motion errors and optionally require Servo mode."""
+
+        status = self._validated_motion_status()
+        if require_servo and status["mode"]["value"] != MOTION_MODE_SERVO:
+            raise RuntimeError(
+                "motion controller is not in Servo mode: "
+                f"mode={status['mode']['value']}"
+            )
+        return status
 
     # ------------ 原接口 ------------------
     def get_img_head(self):
@@ -133,10 +315,17 @@ class RobotNode:
 
         #import pdb; pdb.set_trace()
 
-        left_g = grip[0]
-        right_g = grip[1]
+        try:
+            arm = _as_finite_vector(pos, length=14, name="arm_joint_states")
+            gripper = _as_finite_vector(grip, length=2, name="gripper_states")
+        except ValueError as error:
+            raise RuntimeError(f"机器人关节反馈格式异常: {error}") from error
 
-        return pos[:7] + [left_g] + pos[7:] + [right_g]
+        # Do not use ``+`` here: NumPy arrays would perform element-wise
+        # addition instead of list concatenation and silently corrupt 16-D order.
+        return np.concatenate(
+            [arm[:7], gripper[:1], arm[7:], gripper[1:2]]
+        ).tolist()
 
     def get_head_joint_states(self):
         """返回弧度制头部关节角，便于后续数值运算"""
@@ -160,12 +349,18 @@ class RobotNode:
                 "Smooth joint trajectories require the ruckig package."
             ) from error
 
+        action = _as_finite_vector(action, length=16, name="joint command")
+        self.check_motion_status()
         target_positions = np.concatenate((action[:7], action[8:15]))
 
         # Get current joint states
         current_positions, _ = self.robot.arm_joint_states()
-        if not current_positions:
-            raise Exception("Failed to get arm joint states")
+        try:
+            current_positions = _as_finite_vector(
+                current_positions, length=14, name="arm_joint_states"
+            )
+        except ValueError as error:
+            raise RuntimeError(f"Failed to get arm joint states: {error}") from error
 
         dof = 14  # Degrees of freedom
         interval = 0.01  # Time interval
@@ -174,12 +369,12 @@ class RobotNode:
         rk_output = ruckig.OutputParameter(dof)
 
         # Set current state
-        rk_input.current_position = current_positions
+        rk_input.current_position = current_positions.tolist()
         rk_input.current_velocity = [0.0] * dof
         rk_input.current_acceleration = [0.0] * dof
 
         # Set target state
-        rk_input.target_position = target_positions
+        rk_input.target_position = target_positions.tolist()
         rk_input.target_velocity = [0.0] * dof
         rk_input.target_acceleration = [0.0] * dof
 
@@ -211,18 +406,23 @@ class RobotNode:
         #print(f"Generated {len(trajs)} trajectory points")
         #print("Executing trajectory...")
         for i, traj in enumerate(trajs):
+            if i % 10 == 0:
+                self.check_motion_status()
             #print(f"Executing point {i+1}/{len(trajs)}")
             self.robot.move_arm(traj)
             time.sleep(0.01)
         # sleep 已移除，由 robot_env.py 统一控制
 
         self.robot.move_gripper([action[7], action[15]])
+        self.check_motion_status()
 
     def publish_joint_command_direct(self, action):
         """
         直接发送关节命令，不进行轨迹插值
         action: 16 维 (左臂7维 + 左夹爪1维 + 右臂7维 + 右夹爪1维)
         """
+        action = _as_finite_vector(action, length=16, name="joint command")
+        self.check_motion_status()
         target_positions = np.concatenate((action[:7], action[8:15]))
 
         # Get current joint states for logging
@@ -239,6 +439,7 @@ class RobotNode:
         
         # Move gripper
         self.robot.move_gripper([action[7], action[15]])
+        self.check_motion_status()
         time.sleep(0.01)
         
         # print("Command sent to robot")
@@ -247,22 +448,36 @@ class RobotNode:
         print("开始头部运动测试...")
         # 获取当前头部关节状态
         current_positions, _ = self.robot.head_joint_states()
-        if not current_positions:
-            raise Exception("获取头部关节状态失败")
-        print(f"当前头部位置: {current_positions}")
-        print(f"目标头部位置: {target_positions}")
-        self.robot.move_head(target_positions)
+        try:
+            current_positions = _as_finite_vector(
+                current_positions, length=2, name="head_joint_states"
+            )
+            target_positions = _as_finite_vector(
+                target_positions, length=2, name="head command"
+            )
+        except ValueError as error:
+            raise RuntimeError(f"头部关节状态或命令异常: {error}") from error
+        print(f"当前头部位置: {current_positions.tolist()}")
+        print(f"目标头部位置: {target_positions.tolist()}")
+        self.robot.move_head(target_positions.tolist())
         time.sleep(2)
         print("头部运动完成。\n")
 
     def publish_waist_command(self, target_positions):
         print("开始腰部运动测试...")
         current_positions, _ = self.robot.waist_joint_states()
-        if not current_positions:
-            raise Exception("获取腰部关节状态失败")
-        print(f"当前腰部位置: {current_positions}")
-        print(f"目标腰部位置: {target_positions}")
-        self.robot.move_waist(target_positions)
+        try:
+            current_positions = _as_finite_vector(
+                current_positions, length=2, name="waist_joint_states"
+            )
+            target_positions = _as_finite_vector(
+                target_positions, length=2, name="waist command"
+            )
+        except ValueError as error:
+            raise RuntimeError(f"腰部关节状态或命令异常: {error}") from error
+        print(f"当前腰部位置: {current_positions.tolist()}")
+        print(f"目标腰部位置: {target_positions.tolist()}")
+        self.robot.move_waist(target_positions.tolist())
         time.sleep(2)
         print("腰部运动完成。\n")
 
@@ -270,6 +485,8 @@ class RobotNode:
         """
         调用 SDK 下发相对位姿轨迹控制命令。
         """
+        self.ensure_servo_mode()
+
         # 定义机器人状态字典
         robot_states = {
             "head":  action["head_joint_states"],
@@ -292,12 +509,15 @@ class RobotNode:
             robot_link           = "base_link",#基础坐标系
             trajectory_reference_time = 1.0,#运行的参考时间，越小运行的越快
         )
+        self.check_motion_status(require_servo=True)
 
 
     def publish_abs_pose_command(self, action: dict):
         """
         调用 SDK 下发相对位姿轨迹控制命令。
         """
+        self.ensure_servo_mode()
+
         # 定义机器人状态字典
         robot_states = {
             "head":  action["head_joint_states"],
@@ -320,6 +540,7 @@ class RobotNode:
             robot_link           = "base_link",#基础坐标系
             trajectory_reference_time = 1.0,#运行的参考时间，越小运行的越快
         )
+        self.check_motion_status(require_servo=True)
 
     def publish_abs_pose_command_and_hand(self, action: dict, hand_action: np.ndarray, trajectory_reference_time: float = None):
         """
@@ -333,6 +554,8 @@ class RobotNode:
         """
         if trajectory_reference_time is None:
             trajectory_reference_time = 1.0
+
+        self.ensure_servo_mode()
         
         # 定义机器人状态字典
         robot_states = {
@@ -358,6 +581,8 @@ class RobotNode:
             trajectory_reference_time = trajectory_reference_time,#运行的参考时间，越小运行的越快
         )
 
+        self.check_motion_status(require_servo=True)
+
         self.robot.move_gripper([hand_action[0], hand_action[1]])
 
 
@@ -368,7 +593,27 @@ class RobotNode:
         time.sleep(self.period)
 
     def shutdown(self):
-        self.robot.shutdown()
+        """Release both DDS and camera resources; safe to call repeatedly."""
+
+        errors = []
+        if not getattr(self, "_robot_closed", False):
+            try:
+                self.robot.shutdown()
+            except Exception as error:
+                errors.append(f"RobotDds.shutdown: {error}")
+            else:
+                self._robot_closed = True
+
+        if not getattr(self, "_camera_closed", False):
+            try:
+                self.camera.close()
+            except Exception as error:
+                errors.append(f"CosineCamera.close: {error}")
+            else:
+                self._camera_closed = True
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def get_motion_status(self):
         return self.robot_controller.get_motion_status()

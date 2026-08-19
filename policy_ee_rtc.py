@@ -12,8 +12,9 @@
 机器人环境、websocket policy 和可选 action callback 均由调用方注入，不在此构造。
 ``inference_pi05_g1_desk_ee_rtc`` 与 EE rollout 入口复用该运行时。
 所有目标在下发前经过 EE 单步安全限幅，工作线程异常会停止双方并回传主线程。
-二值夹爪切换默认与对应手臂目标同步：若手臂因单步限幅尚未到达切换帧位姿，
-执行线程保持原夹爪并暂不消费该模型行；门控期间的旧推理响应会被安全拒绝。
+二值夹爪切换默认与对应手臂的真实 EE feedback 同步：执行线程保持原夹爪和
+当前模型行，直到位置/SO(3)误差连续多帧达标；随后切换夹爪并保持一段时间，
+完成后才消费该行。门控期间的旧推理响应会被安全拒绝。
 正常结束或 Ctrl-C 时会取消尚未返回的网络请求，防止遗留线程跨 episode 读取。
 """
 
@@ -37,6 +38,37 @@ from inference_common import (
 
 
 RTC_PREFIX_GRIPPER_RANGE = "0-1"
+
+_EE_ARM_SPECS = (
+    (
+        "left",
+        policy_ee.LEFT_POSITION,
+        policy_ee.LEFT_ROTATION,
+        policy_ee.LEFT_GRIPPER,
+    ),
+    (
+        "right",
+        policy_ee.RIGHT_POSITION,
+        policy_ee.RIGHT_ROTATION,
+        policy_ee.RIGHT_GRIPPER,
+    ),
+)
+
+
+@dataclasses.dataclass
+class _GripperSyncGate:
+    """Runtime-only state for one model row containing a grip transition."""
+
+    arms: tuple[str, ...]
+    target: np.ndarray
+    held_grippers: dict[int, float]
+    desired_grippers: dict[int, float]
+    started_at: float
+    timeout_s: float
+    ideal_motion_time_s: float
+    phase: str = "arm_approach"
+    arm_stable_frames: int = 0
+    actuation_started_at: float | None = None
 
 
 def _tqdm():
@@ -100,9 +132,9 @@ def _simulate_committed_commands(
     """Return the exact EE commands pending on the physical timeline.
 
     Safety processing is sequential: each target is limited relative to the
-    command immediately before it.  When a gripper transition needs more than
-    one arm tick, the execution thread will hold that queue row instead of
-    consuming it.  Such a row and everything after it are therefore not yet a
+    command immediately before it.  Every gripper-transition row has variable
+    duration because execution waits for physical arm feedback and a gripper
+    hold period.  Such a row and everything after it are therefore not yet a
     one-row-per-tick committed timeline and must not be sent as an RTC prefix.
     """
 
@@ -129,25 +161,114 @@ def _simulate_committed_commands(
     return np.stack(committed, axis=0).astype(np.float32, copy=False)
 
 
-def _arm_target_reached(
+def _feedback_arm_arrival(
+    feedback: np.ndarray,
+    target: np.ndarray,
+    *,
+    arms: tuple[str, ...],
+    position_tolerance: float,
+    rotation_tolerance: float,
+) -> tuple[bool, dict[str, tuple[float, float]]]:
+    """Check physical EE feedback against the transition row's arm targets."""
+
+    checked_feedback = policy_ee.checked_vector(
+        feedback, dim=policy_ee.EE_DIM, name="EE gripper-sync feedback"
+    )
+    checked_target = policy_ee.checked_vector(
+        target, dim=policy_ee.EE_DIM, name="EE gripper-sync arrival target"
+    )
+    errors: dict[str, tuple[float, float]] = {}
+    reached = True
+    selected = set(arms)
+    for name, position, rotation, _ in _EE_ARM_SPECS:
+        if name not in selected:
+            continue
+        position_error = float(
+            np.linalg.norm(checked_feedback[position] - checked_target[position])
+        )
+        rotation_error = policy_ee.rotation_distance(
+            checked_feedback[rotation], checked_target[rotation]
+        )
+        errors[name] = (position_error, rotation_error)
+        reached = reached and position_error <= position_tolerance
+        reached = reached and rotation_error <= rotation_tolerance
+    return reached, errors
+
+
+def _gripper_gate_timing(
     previous_command: np.ndarray,
     target: np.ndarray,
     *,
-    position: slice,
-    rotation: slice,
-) -> bool:
-    """Whether the previously published command reached a grip-event target."""
+    arms: tuple[str, ...],
+    args: "RTCArgs",
+) -> tuple[float, float]:
+    """Return a distance-aware gate timeout and ideal command travel time.
 
-    # ``process_ee_action`` returns the exact target component once it is inside
-    # the configured step limit.  A small absolute tolerance only absorbs
-    # float32 round-off; it is not a physical arrival tolerance.
-    position_error = float(
-        np.linalg.norm(previous_command[position] - target[position])
+    A fixed timeout is invalid when the per-tick limiter is configurable: with
+    a smaller limit, reaching the exact same model row necessarily takes more
+    ticks.  Estimate the lower-bound command travel time using Euclidean
+    position distance and shortest-path SO(3) rotation distance, then add
+    trajectory completion, stable-feedback, gripper-settle and tracking
+    margins.  The configured timeout remains a minimum, while the maximum
+    prevents an outlier target from holding the episode indefinitely.
+    """
+
+    previous = policy_ee.checked_vector(
+        previous_command,
+        dim=policy_ee.EE_DIM,
+        name="previous EE command for gripper gate timing",
     )
-    rotation_error = float(
-        np.linalg.norm(previous_command[rotation] - target[rotation])
+    checked_target = policy_ee.checked_vector(
+        target,
+        dim=policy_ee.EE_DIM,
+        name="EE target for gripper gate timing",
     )
-    return position_error <= 1e-6 and rotation_error <= 1e-6
+    selected = set(arms)
+    required_steps = 1
+    for name, position, rotation, _ in _EE_ARM_SPECS:
+        if name not in selected:
+            continue
+        if args.max_position_delta is not None:
+            position_distance = float(
+                np.linalg.norm(checked_target[position] - previous[position])
+            )
+            required_steps = max(
+                required_steps,
+                int(np.ceil(position_distance / float(args.max_position_delta))),
+            )
+        if args.max_rotation_delta is not None:
+            rotation_distance = policy_ee.rotation_distance(
+                previous[rotation], checked_target[rotation]
+            )
+            required_steps = max(
+                required_steps,
+                int(np.ceil(rotation_distance / float(args.max_rotation_delta))),
+            )
+
+    ideal_motion_time = required_steps / float(args.control_frequency)
+    trajectory_time = float(args.trajectory_time or (1.1 / args.control_frequency))
+    stable_time = args.gripper_sync_stable_frames / float(args.control_frequency)
+    # Physical tracking is asynchronous.  Allow at least one extra second and
+    # 50% of the command travel time before treating the target as unreachable.
+    tracking_margin = max(1.0, 0.5 * ideal_motion_time)
+    estimated_total = (
+        ideal_motion_time
+        + trajectory_time
+        + stable_time
+        + float(args.gripper_settle_time)
+        + tracking_margin
+    )
+    effective_timeout = max(float(args.gripper_sync_timeout), estimated_total)
+    if effective_timeout > float(args.gripper_sync_max_timeout):
+        raise RuntimeError(
+            "EE RTC gripper synchronization target cannot be reached within "
+            "the configured safety cap: "
+            f"ideal_motion={ideal_motion_time:.2f}s, "
+            f"required_timeout={effective_timeout:.2f}s, "
+            f"max_timeout={args.gripper_sync_max_timeout:.2f}s; increase the "
+            "per-tick motion limit or explicitly raise the gate maximum"
+        )
+    return effective_timeout, ideal_motion_time
 
 
 def _process_command_with_gripper_sync(
@@ -157,11 +278,11 @@ def _process_command_with_gripper_sync(
 ) -> tuple[np.ndarray, tuple[str, ...]]:
     """Limit one EE target and defer grip changes until its arm reaches it.
 
-    The returned arm command is identical to the ordinary RTC limiter.  In
-    binary mode, however, a requested gripper transition is held at its prior
-    value while the associated arm still has limited pose distance remaining.
-    ``pending_arms`` tells the caller to keep the current model row at the head
-    of the queue and execute it again on the next physical tick.
+    This pure helper is used by committed-prefix simulation, not as the live
+    arrival detector.  In binary synchronization mode every requested gripper
+    transition is held at its prior value and reported through
+    ``pending_arms``; only the live runner can complete that variable-duration
+    row after reading physical EE feedback.
     """
 
     checked_target = policy_ee.checked_vector(
@@ -186,38 +307,18 @@ def _process_command_with_gripper_sync(
         return command, ()
 
     pending: list[str] = []
-    arm_specs = (
-        (
-            "left",
-            policy_ee.LEFT_POSITION,
-            policy_ee.LEFT_ROTATION,
-            policy_ee.LEFT_GRIPPER,
-        ),
-        (
-            "right",
-            policy_ee.RIGHT_POSITION,
-            policy_ee.RIGHT_ROTATION,
-            policy_ee.RIGHT_GRIPPER,
-        ),
-    )
-    for name, position, rotation, gripper in arm_specs:
+    for name, _, _, gripper in _EE_ARM_SPECS:
         transition_requested = abs(
             float(command[gripper]) - float(previous[gripper])
         ) >= 0.5
         if not transition_requested:
             continue
-        # Test the previously published command, not the command being built
-        # for this tick.  Thus the arm receives the endpoint while the old
-        # gripper is still held, gets one complete control period to execute
-        # that last SDK segment, and only switches the gripper on the next tick.
-        if not _arm_target_reached(
-            previous,
-            checked_target,
-            position=position,
-            rotation=rotation,
-        ):
-            command[gripper] = previous[gripper]
-            pending.append(name)
+        # A physical-feedback gate has variable duration and therefore cannot
+        # be represented as one model-row-per-tick in an RTC prefix.  Stop the
+        # committed simulation before every transition row, even when command
+        # values already equal its pose target.
+        command[gripper] = previous[gripper]
+        pending.append(name)
     return command.astype(np.float32, copy=False), tuple(pending)
 
 
@@ -271,7 +372,26 @@ class RTCArgs(policy_ee.EEArgs):
     # reached that model row's absolute EE target.  This keeps rate limiting
     # from making grasp/release happen earlier than the arm phase.
     sync_gripper_to_arm: bool = True
-    gripper_sync_timeout: float = 2.0
+    gripper_sync_timeout: float = 5.0
+    """Minimum total gate timeout; distance-aware timing may extend it."""
+
+    gripper_sync_max_timeout: float = 30.0
+    """Hard safety cap for a distance-extended physical feedback gate."""
+
+    gripper_sync_position_tolerance: float = 0.005
+    """Physical EE position tolerance in metres for a grip-event arm."""
+
+    gripper_sync_rotation_tolerance: float = 0.05
+    """Shortest SO(3) feedback error in radians for a grip-event arm."""
+
+    gripper_sync_stable_frames: int = 3
+    """Consecutive physical-feedback frames required before grip actuation."""
+
+    gripper_settle_time: float = 0.20
+    """Seconds to hold the arm target and new grip command before advancing."""
+
+    replan_after_gripper_sync: bool = True
+    """Discard the pre-grasp tail and request a fresh chunk after each event."""
     # ``none`` keeps both arms active. ``left``/``right`` freezes the selected
     # arm in both the RTC policy timeline and RobotEnv hardware command path.
     freeze_arm: str = "none"
@@ -318,6 +438,40 @@ def validate_rtc_args(args: RTCArgs) -> None:
         or args.gripper_sync_timeout <= 0
     ):
         raise ValueError("gripper_sync_timeout must be finite and positive")
+    if (
+        not np.isfinite(args.gripper_sync_max_timeout)
+        or args.gripper_sync_max_timeout < args.gripper_sync_timeout
+    ):
+        raise ValueError(
+            "gripper_sync_max_timeout must be finite and >= "
+            "gripper_sync_timeout"
+        )
+    if (
+        not np.isfinite(args.gripper_sync_position_tolerance)
+        or args.gripper_sync_position_tolerance <= 0
+    ):
+        raise ValueError(
+            "gripper_sync_position_tolerance must be finite and positive"
+        )
+    if (
+        not np.isfinite(args.gripper_sync_rotation_tolerance)
+        or args.gripper_sync_rotation_tolerance <= 0
+    ):
+        raise ValueError(
+            "gripper_sync_rotation_tolerance must be finite and positive"
+        )
+    if (
+        isinstance(args.gripper_sync_stable_frames, bool)
+        or not isinstance(args.gripper_sync_stable_frames, (int, np.integer))
+        or args.gripper_sync_stable_frames <= 0
+    ):
+        raise ValueError("gripper_sync_stable_frames must be a positive integer")
+    if not np.isfinite(args.gripper_settle_time) or args.gripper_settle_time < 0:
+        raise ValueError("gripper_settle_time must be finite and non-negative")
+    if args.gripper_settle_time >= args.gripper_sync_timeout:
+        raise ValueError(
+            "gripper_settle_time must be smaller than gripper_sync_timeout"
+        )
     if not 1 <= args.rtc_prefix_len < args.action_horizon:
         raise ValueError(
             f"rtc_prefix_len must be in [1, {args.action_horizon - 1}]"
@@ -357,7 +511,18 @@ class RTCRunner:
         initial_obs: dict,
         action_callback: Callable[[np.ndarray], None] | None = None,
         action_trace_callback: (
-            Callable[[np.ndarray, np.ndarray, int, np.ndarray], None] | None
+            Callable[
+                [
+                    np.ndarray,
+                    np.ndarray,
+                    int,
+                    np.ndarray,
+                    np.ndarray | None,
+                    int | None,
+                ],
+                None,
+            ]
+            | None
         ) = None,
     ) -> None:
         self.args = args
@@ -367,7 +532,8 @@ class RTCRunner:
         self.initial_obs = initial_obs
         self.action_callback = action_callback
         # The trace callback receives effective target, applied command,
-        # 1-based step, and the untouched server row.
+        # 1-based step, untouched server row, and (when the physical gate read
+        # it atomically) same-space hardware feedback plus its local timestamp.
         self.action_trace_callback = action_trace_callback
         self.period = 1.0 / args.control_frequency
         initial_command = policy_ee.state_ee_to_action_command(
@@ -401,16 +567,8 @@ class RTCRunner:
         # crossed such a tick stale even though its pop-count did not change.
         self._timeline_revision = 0
         self._gripper_gate_active = False
+        self._gripper_gate: _GripperSyncGate | None = None
         self._gripper_gate_steps = 0
-        self._gripper_gate_max_steps = max(
-            1,
-            int(
-                np.ceil(
-                    float(args.gripper_sync_timeout)
-                    * float(args.control_frequency)
-                )
-            ),
-        )
         self._gripper_gate_events = 0
         self._error: BaseException | None = None
         self._printed_first_request = False
@@ -556,25 +714,32 @@ class RTCRunner:
                 # that will activate the gripper/arm gate.
                 lock_len = min(lock_len, len(committed))
 
-                with self._lock:
-                    elapsed_pops = max(0, self._pop_count - request_pop_count)
-                    use_index, replacement = _aligned_replacement(
-                        actions, elapsed_pops
-                    )
-                    _, raw_replacement = _aligned_replacement(
-                        raw_actions, elapsed_pops
-                    )
-                    timeline_changed = (
-                        self._timeline_revision != request_timeline_revision
-                    )
-                    handoff_rejected = timeline_changed or (
-                        lock_len > 0 and elapsed_pops > lock_len
-                    )
-                    if handoff_rejected:
-                        self._handoff_rejections += 1
-                    if not self._stop.is_set() and not handoff_rejected:
-                        self._queue = replacement
-                        self._raw_queue = raw_replacement
+                # A response handoff must not replace queue[0] while the
+                # execution thread has selected that row and is waiting for
+                # its atomic command+feedback SDK operation to return.
+                with self._observation_gate:
+                    with self._lock:
+                        elapsed_pops = max(
+                            0, self._pop_count - request_pop_count
+                        )
+                        use_index, replacement = _aligned_replacement(
+                            actions, elapsed_pops
+                        )
+                        _, raw_replacement = _aligned_replacement(
+                            raw_actions, elapsed_pops
+                        )
+                        timeline_changed = (
+                            self._timeline_revision
+                            != request_timeline_revision
+                        )
+                        handoff_rejected = timeline_changed or (
+                            lock_len > 0 and elapsed_pops > lock_len
+                        )
+                        if handoff_rejected:
+                            self._handoff_rejections += 1
+                        if not self._stop.is_set() and not handoff_rejected:
+                            self._queue = replacement
+                            self._raw_queue = raw_replacement
 
                 if handoff_rejected:
                     if timeline_changed:
@@ -628,18 +793,24 @@ class RTCRunner:
                 gate_message = None
                 model_target = None
                 executed_step = None
+                feedback_sample = None
+                feedback_timestamp_ns = None
                 with self._observation_gate:
                     with self._lock:
                         if self._stop.is_set():
                             command = None
                             finished = True
                         elif self._steps_done >= self.args.max_timesteps:
+                            if self._gripper_gate is not None:
+                                raise RuntimeError(
+                                    "max_timesteps was reached while an EE RTC "
+                                    "gripper synchronization gate was still "
+                                    f"active (phase={self._gripper_gate.phase}); "
+                                    "the episode is incomplete"
+                                )
                             command = None
                             finished = True
                         elif self._queue:
-                            # Peek first.  A gripper-transition row remains at
-                            # the head until the limited arm command reaches
-                            # that row's absolute pose target.
                             target = self._queue[0]
                             raw_model_target = (
                                 self._raw_queue[0]
@@ -648,57 +819,223 @@ class RTCRunner:
                             )
                             model_target = target.copy()
                             previous_command = self._last_command.copy()
-                            command, pending_arms = (
-                                _process_command_with_gripper_sync(
-                                    target,
-                                    self._last_command,
-                                    self.args,
-                                )
+                            command = policy_ee.process_ee_action(
+                                target,
+                                previous_command,
+                                max_position_delta=self.args.max_position_delta,
+                                max_rotation_delta=self.args.max_rotation_delta,
+                                binarize_gripper=self.args.binarize_gripper,
+                                gripper_threshold=self.args.gripper_threshold,
+                                gripper_close_threshold=(
+                                    self.args.gripper_close_threshold
+                                ),
+                                gripper_open_threshold=(
+                                    self.args.gripper_open_threshold
+                                ),
                             )
-                            was_gated = self._gripper_gate_active
-                            if pending_arms:
-                                self._gripper_gate_active = True
-                                self._gripper_gate_steps += 1
-                                if not was_gated:
+
+                            if (
+                                self._gripper_gate is None
+                                and self.args.sync_gripper_to_arm
+                                and self.args.binarize_gripper
+                            ):
+                                transition_arms = tuple(
+                                    name
+                                    for name, _, _, gripper in _EE_ARM_SPECS
+                                    if abs(
+                                        float(command[gripper])
+                                        - float(previous_command[gripper])
+                                    )
+                                    >= 0.5
+                                )
+                                if transition_arms:
+                                    gate_timeout, ideal_motion_time = (
+                                        _gripper_gate_timing(
+                                            previous_command,
+                                            target,
+                                            arms=transition_arms,
+                                            args=self.args,
+                                        )
+                                    )
+                                    selected = set(transition_arms)
+                                    held_grippers = {
+                                        gripper: float(previous_command[gripper])
+                                        for name, _, _, gripper in _EE_ARM_SPECS
+                                        if name in selected
+                                    }
+                                    desired_grippers = {
+                                        gripper: float(command[gripper])
+                                        for name, _, _, gripper in _EE_ARM_SPECS
+                                        if name in selected
+                                    }
+                                    self._gripper_gate = _GripperSyncGate(
+                                        arms=transition_arms,
+                                        target=target.copy(),
+                                        held_grippers=held_grippers,
+                                        desired_grippers=desired_grippers,
+                                        started_at=time.monotonic(),
+                                        timeout_s=gate_timeout,
+                                        ideal_motion_time_s=ideal_motion_time,
+                                    )
+                                    self._gripper_gate_steps = 0
                                     self._gripper_gate_events += 1
-                                    gate_message = (
-                                        "[EE RTC gripper-sync] holding model "
-                                        "row until arm target is reached: "
-                                        + ",".join(pending_arms)
-                                    )
-                                if (
-                                    self._gripper_gate_steps
-                                    > self._gripper_gate_max_steps
-                                ):
+
+                            gate = self._gripper_gate
+                            if gate is not None:
+                                elapsed_gate = time.monotonic() - gate.started_at
+                                if elapsed_gate > gate.timeout_s:
                                     raise RuntimeError(
-                                        "EE RTC gripper/arm synchronization "
+                                        "EE RTC physical gripper synchronization "
                                         "timed out after "
-                                        f"{self.args.gripper_sync_timeout:g}s "
-                                        f"for {','.join(pending_arms)} arm; "
-                                        "the gripper was kept at its previous "
-                                        "state and the episode was stopped"
+                                        f"{gate.timeout_s:.2f}s "
+                                        f"during phase={gate.phase} for "
+                                        f"{','.join(gate.arms)} arm; the episode "
+                                        "was stopped instead of advancing the "
+                                        "model timeline"
                                     )
-                            else:
-                                # This row is now complete (or never needed a
-                                # gate), so it advances the model/RTC timeline.
+                                gripper_values = (
+                                    gate.held_grippers
+                                    if gate.phase == "arm_approach"
+                                    else gate.desired_grippers
+                                )
+                                for gripper, value in gripper_values.items():
+                                    command[gripper] = value
+                                self._gripper_gate_active = True
+                                if self._gripper_gate_steps == 0:
+                                    gate_message = (
+                                        "[EE RTC gripper-sync] holding the model "
+                                        "row and old gripper until physical EE "
+                                        "feedback reaches the target: "
+                                        + ",".join(gate.arms)
+                                        + f" (ideal_motion="
+                                        f"{gate.ideal_motion_time_s:.2f}s, "
+                                        f"timeout={gate.timeout_s:.2f}s)"
+                                    )
+                            finished = False
+                        else:
+                            command = None
+                            finished = False
+
+                    if command is not None:
+                        if self.env is None:
+                            feedback_sample = command.copy()
+                            feedback_timestamp_ns = time.time_ns()
+                        elif self._gripper_gate is not None:
+                            (
+                                feedback_sample,
+                                feedback_timestamp_ns,
+                            ) = self.env.step_with_control_feedback(command.copy())
+                        else:
+                            self.env.step(command.copy(), update_obs=False)
+
+                        # Only mutate the RTC timeline after the hardware call
+                        # succeeds.  The observation gate prevents response
+                        # handoff from replacing the selected queue row here.
+                        with self._lock:
+                            gate = self._gripper_gate
+                            self._last_command = command.copy()
+                            self._steps_done += 1
+                            executed_step = self._steps_done
+
+                            if gate is None:
                                 self._queue.pop(0)
                                 if self._raw_queue:
                                     self._raw_queue.pop(0)
                                 self._pop_count += 1
-                                self._gripper_gate_active = False
-                                self._gripper_gate_steps = 0
-                                if was_gated:
+                            else:
+                                if feedback_sample is None:
+                                    raise RuntimeError(
+                                        "physical EE feedback is required while "
+                                        "a gripper synchronization gate is active"
+                                    )
+                                self._gripper_gate_steps += 1
+                                self._timeline_revision += 1
+                                now = time.monotonic()
+                                if gate.phase == "arm_approach":
+                                    reached, errors = _feedback_arm_arrival(
+                                        feedback_sample,
+                                        gate.target,
+                                        arms=gate.arms,
+                                        position_tolerance=(
+                                            self.args.gripper_sync_position_tolerance
+                                        ),
+                                        rotation_tolerance=(
+                                            self.args.gripper_sync_rotation_tolerance
+                                        ),
+                                    )
+                                    gate.arm_stable_frames = (
+                                        gate.arm_stable_frames + 1
+                                        if reached
+                                        else 0
+                                    )
+                                    if self.args.debug and (
+                                        self._gripper_gate_steps == 1
+                                        or self._gripper_gate_steps % 10 == 0
+                                    ):
+                                        error_text = ", ".join(
+                                            f"{name}:pos={values[0]:.4f}m/"
+                                            f"rot={values[1]:.4f}rad"
+                                            for name, values in errors.items()
+                                        )
+                                        gate_message = (
+                                            "[EE RTC gripper-sync] physical "
+                                            f"arrival {error_text}; stable="
+                                            f"{gate.arm_stable_frames}/"
+                                            f"{self.args.gripper_sync_stable_frames}"
+                                        )
+                                    if (
+                                        gate.arm_stable_frames
+                                        >= self.args.gripper_sync_stable_frames
+                                    ):
+                                        gate.phase = "gripper_actuate"
+                                        gate_message = (
+                                            "[EE RTC gripper-sync] physical EE "
+                                            "feedback is stable at the target; "
+                                            "the gripper will switch next tick"
+                                        )
+                                elif gate.phase == "gripper_actuate":
+                                    gate.phase = "gripper_settle"
+                                    gate.actuation_started_at = now
                                     gate_message = (
-                                        "[EE RTC gripper-sync] arm target "
-                                        "reached; applying gripper transition "
-                                        "and resuming RTC row consumption"
+                                        "[EE RTC gripper-sync] gripper command "
+                                        "applied; holding the EE target for "
+                                        f"{self.args.gripper_settle_time:g}s"
+                                    )
+                                elif gate.phase == "gripper_settle":
+                                    if gate.actuation_started_at is None:
+                                        raise RuntimeError(
+                                            "gripper synchronization gate lost "
+                                            "its actuation timestamp"
+                                        )
+                                    if (
+                                        now - gate.actuation_started_at
+                                        >= self.args.gripper_settle_time
+                                    ):
+                                        self._queue.pop(0)
+                                        if self._raw_queue:
+                                            self._raw_queue.pop(0)
+                                        self._pop_count += 1
+                                        if self.args.replan_after_gripper_sync:
+                                            self._queue.clear()
+                                            self._raw_queue.clear()
+                                        self._gripper_gate = None
+                                        self._gripper_gate_active = False
+                                        self._gripper_gate_steps = 0
+                                        gate_message = (
+                                            "[EE RTC gripper-sync] gripper hold "
+                                            "completed; consumed one model row"
+                                            + (
+                                                " and requested a fresh chunk"
+                                                if self.args.replan_after_gripper_sync
+                                                else ""
+                                            )
+                                        )
+                                else:
+                                    raise RuntimeError(
+                                        "unknown gripper synchronization phase: "
+                                        f"{gate.phase}"
                                     )
 
-                            # Every physical command issued while a row is or
-                            # was gated invalidates an inference snapshot whose
-                            # pop count alone cannot observe that movement.
-                            if pending_arms or was_gated:
-                                self._timeline_revision += 1
                             if self.args.binarize_gripper:
                                 transition_messages = (
                                     format_binary_gripper_transitions(
@@ -710,19 +1047,9 @@ class RTCRunner:
                                             ("right", policy_ee.RIGHT_GRIPPER),
                                         ),
                                         prefix="EE RTC gripper",
-                                        step=self._steps_done + 1,
+                                        step=self._steps_done,
                                     )
                                 )
-                            self._last_command = command.copy()
-                            self._steps_done += 1
-                            executed_step = self._steps_done
-                            finished = False
-                        else:
-                            command = None
-                            finished = False
-
-                    if command is not None and self.env is not None:
-                        self.env.step(command.copy(), update_obs=False)
 
                 if finished:
                     break
@@ -750,6 +1077,12 @@ class RTCRunner:
                             command.copy(),
                             executed_step,
                             raw_model_target.copy(),
+                            (
+                                None
+                                if feedback_sample is None
+                                else feedback_sample.copy()
+                            ),
+                            feedback_timestamp_ns,
                         )
                     if self.action_callback is not None:
                         self.action_callback(command.copy())

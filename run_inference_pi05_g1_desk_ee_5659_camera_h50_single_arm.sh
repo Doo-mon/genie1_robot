@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 启动命令：bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm.sh
+#
 # 5659 同步 EE 单臂隔离测试入口。
 #
 # FREEZE_ARM=left（默认）：冻结左臂，只测试右臂。

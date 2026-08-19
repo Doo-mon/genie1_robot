@@ -374,6 +374,7 @@ def main(args: SyncRolloutArgs) -> None:
                             if args.retime_action_chunk
                             else "ee_sync_effective_target"
                         ),
+                        environment=env,
                     )
                     previous_command = action
 

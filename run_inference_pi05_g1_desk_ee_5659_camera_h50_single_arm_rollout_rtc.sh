@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 启动命令：bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm_rollout_rtc.sh
+#
 # 5659 EE RTC + rollout 的单臂隔离测试入口。
 #
 # FREEZE_ARM=left（默认）：EE 与 SDK ABS_POSE 两层冻结左臂，只测试右臂。
