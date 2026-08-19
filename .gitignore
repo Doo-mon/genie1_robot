@@ -1,0 +1,37 @@
+# 暂时不纳入客户端仓库的服务端源码；需要时删除本行再单独提交。
+/src/
+
+# Python 缓存、虚拟环境和测试缓存。
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Notebook、编辑器和操作系统生成文件。
+.ipynb_checkpoints/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 推理运行日志、绘图和 rollout 数据集。
+/logs/
+/plots/
+/rollout_datasets/
+*.log
+*.parquet
+*.mp4
+episode_*_grippers.csv
+/camera.txt
+
+# 本机私有环境变量文件（示例文件仍可用 !*.example 显式加入）。
+.env
+.env.*
+!.env.example
