@@ -24,6 +24,7 @@
 ├── plot_action_log.py      从动作 JSONL 离线生成逐维曲线和全维度总览 SVG
 ├── rollout_schemas.py      运行时观测/命令到数据集 state/action 的映射
 ├── rollout_recorder.py     三路视频、Parquet、LeRobot 风格 metadata
+├── server_src/            从服务端复制的 OpenPI/服务启动参考快照
 └── robot_env.py
     └── robot_interface_wrapper.py -> robot_interface.py -> a2d_sdk
 ```
@@ -48,6 +49,7 @@
 | `inference.py` | 兼容 bread/旧 18D、20D 控制链路；也使用同一 WebSocket 工厂，但不要把它的维度定义混入 desk EE/joint 合同。 |
 | `robot_env.py` | Gym 风格真实机器人封装；`reset()` 可能运动，`step()` 下发命令，`get_obs()` 读取三路图像和状态，并以统一锁串行化硬件访问。 |
 | `robot_interface.py` | a2d_sdk 底层接口。构造时等待 head/左腕/右腕三路图像、14D 手臂和双夹爪数据；等待过久只告警，不自动退出。 |
+| `server_src/` | 服务端模型、RTC policy、WebSocket server 和训练配置的参考快照；客户端运行时不导入、不测试该目录。其中历史 dataset/checkpoint 绝对路径只记录原服务端部署，现场使用时应通过环境变量或启动参数覆盖。 |
 | `env_for_g1.sh` | 激活机器人 SDK/conda 环境并进入工作区；应使用 `source`。 |
 
 活跃的 11 个 Shell launcher：
@@ -206,7 +208,7 @@ cd <REMOTE_OPENPI_WORKSPACE>
 source <REMOTE_MODEL_ENV_ACTIVATION>
 
 REMOTE_MODEL_PORT=<REMOTE_MODEL_PORT>
-python scripts/serve_policy.py --port "${REMOTE_MODEL_PORT}" <POLICY_ARGS>
+python server_src/serve_policy.py --port "${REMOTE_MODEL_PORT}" <POLICY_ARGS>
 ```
 
 `<POLICY_ARGS>` 应替换成部署已经验证过的 config/checkpoint 参数，不要从本文猜测。确认日志显示模型加载完成或 WebSocket server 已监听。若服务端提供 `/healthz`，可在远端检查：
