@@ -13,6 +13,15 @@
 # RTC 还默认把二值夹爪切换与对应手臂目标同步：手臂受单步限幅尚未到达
 # 切换帧位姿时，保持旧夹爪并暂停消费该模型 row；到达后才夹紧或松开。
 # 该门控只作用于夹爪切换帧，不会把整个 H50 chunk 做可变长度重采样。
+# 真机标定后可分别设置左右末端最低位置，例如：
+#   MIN_LEFT_EE_BASE_Z=<左值_米> MIN_RIGHT_EE_BASE_Z=<右值_米> \
+#     bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_rollout_rtc.sh
+
+#   MIN_LEFT_EE_BASE_Z=0.585 MIN_RIGHT_EE_BASE_Z=0.575 bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_rollout_rtc.sh
+##  5659 任务全程建议 MAX_TIMESTEPS 设置为4000  （不失误二次尝试的话 3000足够完成所有任务）
+
+
+
 # REMOTE_HOST、REMOTE_PORT 与 WS_* 网络参数会从调用环境原样保留，由通用
 # launcher 转成 Python 参数；同样慢启动等待，但已发送请求默认不重发。
 # 父环境中的 PROMPT 仍优先于 PROMPT_KEY，默认 key 为 named:5659-all；任何来源的

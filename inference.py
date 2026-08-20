@@ -644,6 +644,15 @@ class Args:
     max_rotation_delta: float | None = 0.02
     """camera_position 每步单手轴角最大变化"""
 
+    min_ee_base_z: float | None = None
+    """camera_position 在 base_link 坐标系中的共同最小 z（兼容参数）"""
+
+    min_left_ee_base_z: float | None = None
+    """camera_position 左末端独立最小 z；优先于共同值"""
+
+    min_right_ee_base_z: float | None = None
+    """camera_position 右末端独立最小 z；优先于共同值"""
+
     max_joint_delta: float | None = 0.15
     """joint_position 每个手臂关节最大单步变化"""
     
@@ -710,6 +719,24 @@ def validate_args(args: Args) -> None:
         value = getattr(args, name)
         if value is not None and (not np.isfinite(value) or value <= 0):
             raise ValueError(f"{name} must be finite and positive or None")
+    floor_names = (
+        "min_ee_base_z",
+        "min_left_ee_base_z",
+        "min_right_ee_base_z",
+    )
+    configured_floors = [
+        (name, getattr(args, name))
+        for name in floor_names
+        if getattr(args, name) is not None
+    ]
+    if configured_floors:
+        if args.control_mode != "camera_position":
+            raise ValueError(
+                "EE base z floors are only valid for camera_position mode"
+            )
+        for name, value in configured_floors:
+            if not np.isfinite(value):
+                raise ValueError(f"{name} must be finite or None")
     if args.trajectory_time is not None and (
         not np.isfinite(args.trajectory_time) or args.trajectory_time <= 0
     ):
@@ -776,9 +803,25 @@ def main(args: Args):
     print(f"  模型输出频率: {args.control_frequency} Hz (周期 {control_period*1000:.1f} ms)")
     print(f"  开环 horizon: {args.open_loop_horizon}")
     if args.control_mode == "camera_position":
+        left_z_floor = (
+            args.min_ee_base_z
+            if args.min_left_ee_base_z is None
+            else args.min_left_ee_base_z
+        )
+        right_z_floor = (
+            args.min_ee_base_z
+            if args.min_right_ee_base_z is None
+            else args.min_right_ee_base_z
+        )
         print(
             "  单步安全限幅: "
             f"position={args.max_position_delta}, rotation={args.max_rotation_delta}"
+        )
+        print(
+            "  base_link EE z 最低位置: "
+            f"left={'disabled' if left_z_floor is None else f'{left_z_floor:.4f} m'}, "
+            f"right={'disabled' if right_z_floor is None else f'{right_z_floor:.4f} m'} "
+            "(clamp before SDK)"
         )
     else:
         print(f"  单步关节限幅: {args.max_joint_delta}")
@@ -829,6 +872,21 @@ def main(args: Args):
                     else args.control_frequency
                 ),
                 trajectory_time=trajectory_time,
+                min_ee_base_z=(
+                    args.min_ee_base_z
+                    if args.control_mode == "camera_position"
+                    else None
+                ),
+                min_left_ee_base_z=(
+                    args.min_left_ee_base_z
+                    if args.control_mode == "camera_position"
+                    else None
+                ),
+                min_right_ee_base_z=(
+                    args.min_right_ee_base_z
+                    if args.control_mode == "camera_position"
+                    else None
+                ),
                 # Only this compatibility entry builds the legacy 20-D joint
                 # observation.  Thin joint policies remain 16-D and avoid two
                 # unnecessary hardware polls on every RTC observation.

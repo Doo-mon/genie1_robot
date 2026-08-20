@@ -6,6 +6,8 @@
 # prefix 夹爪范围固定为 0--1，不提供 Shell 切换参数。
 # 夹爪约定 0=张开、1=闭合，默认启用 close=0.90/open=0.50 双阈值滞回；
 # rollout 保存经过该处理后实际发送的命令，旧单阈值只作为显式兼容覆盖。
+# MIN_LEFT_EE_BASE_Z / MIN_RIGHT_EE_BASE_Z 分别设置左右最低 z（米）；
+# MIN_EE_BASE_Z 是兼容共同值，单臂值优先，越界时钳位后继续执行。
 # WS_* 控制慢启动等待、握手/响应超时和退避；默认不重发已经发送的请求，
 # 仅 WS_INFERENCE_RETRIES>0 才重连重发。"$@" 可继续覆盖 Python 参数。
 # PROMPT（兼容 FIXED_PROMPT）优先于 PROMPT_KEY；都为空时显示交互菜单，
@@ -41,6 +43,9 @@ RTC_REFILL_AT="${RTC_REFILL_AT:-12}"
 BINARIZE_GRIPPER="${BINARIZE_GRIPPER:-true}"
 MAX_POSITION_DELTA="${MAX_POSITION_DELTA:-0.0005}"
 MAX_ROTATION_DELTA="${MAX_ROTATION_DELTA:-0.0025}"
+MIN_EE_BASE_Z="${MIN_EE_BASE_Z:-}"
+MIN_LEFT_EE_BASE_Z="${MIN_LEFT_EE_BASE_Z:-}"
+MIN_RIGHT_EE_BASE_Z="${MIN_RIGHT_EE_BASE_Z:-}"
 # 30 Hz 的控制周期约为 0.033 s；默认轨迹时间略短于一个周期，避免
 # 每条单点轨迹执行到一半就被下一条命令打断。
 TRAJECTORY_TIME="${TRAJECTORY_TIME:-0.03}"
@@ -60,6 +65,15 @@ esac
 if [[ -n "${GRIPPER_THRESHOLD:-}" ]]; then
   # Legacy compatibility: a single threshold intentionally disables hysteresis.
   EXTRA_ARGS+=(--gripper-threshold="${GRIPPER_THRESHOLD}")
+fi
+if [[ -n "${MIN_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-ee-base-z="${MIN_EE_BASE_Z}")
+fi
+if [[ -n "${MIN_LEFT_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-left-ee-base-z="${MIN_LEFT_EE_BASE_Z}")
+fi
+if [[ -n "${MIN_RIGHT_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-right-ee-base-z="${MIN_RIGHT_EE_BASE_Z}")
 fi
 if [[ -n "${ROLLOUT_OUTPUT_DIR}" ]]; then
   EXTRA_ARGS+=(--rollout-output-dir="${ROLLOUT_OUTPUT_DIR}")

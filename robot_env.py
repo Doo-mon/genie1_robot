@@ -44,6 +44,9 @@ class RobotEnv:
         retargeter: Optional[Any] = None,
         include_auxiliary_state: bool = False,
         freeze_arm: Literal["none", "left", "right"] = "none",
+        min_ee_base_z: Optional[float] = None,
+        min_left_ee_base_z: Optional[float] = None,
+        min_right_ee_base_z: Optional[float] = None,
     ):
         """
         Args:
@@ -59,6 +62,11 @@ class RobotEnv:
                 2 维腰部状态；仅旧 20 维兼容策略需要
             freeze_arm: camera 模式的硬件隔离开关；在 reset 后锁住所选
                 手臂的 6 维 ABS_POSE 目标和夹爪命令
+            min_ee_base_z: 机器人 ``base_link`` 坐标系中左右末端允许的
+                共同最小 z（米）；单臂参数未设置时使用它作为回退值
+            min_left_ee_base_z: 左末端独立最小 z，优先于共同值
+            min_right_ee_base_z: 右末端独立最小 z，优先于共同值。所有高度
+                限制均在 IK/标定转换后、SDK 下发前检查
         """
         if not math.isfinite(hz) or hz <= 0:
             raise ValueError(f"hz must be finite and positive, got {hz}")
@@ -69,6 +77,19 @@ class RobotEnv:
             raise ValueError("freeze_arm must be one of: none, left, right")
         if normalized_freeze_arm != "none" and control_mode != "camera_position":
             raise ValueError("freeze_arm is only supported in camera_position mode")
+        configured_floors = {
+            "min_ee_base_z": min_ee_base_z,
+            "min_left_ee_base_z": min_left_ee_base_z,
+            "min_right_ee_base_z": min_right_ee_base_z,
+        }
+        if any(value is not None for value in configured_floors.values()):
+            if control_mode != "camera_position":
+                raise ValueError(
+                    "EE base z floors are only supported in camera_position mode"
+                )
+        for name, value in configured_floors.items():
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite or None")
         if trajectory_time is not None and (
             not math.isfinite(trajectory_time) or trajectory_time <= 0
         ):
@@ -78,6 +99,19 @@ class RobotEnv:
         self.use_smooth_trajectory = use_smooth_trajectory
         self.include_auxiliary_state = bool(include_auxiliary_state)
         self.freeze_arm = normalized_freeze_arm
+        self.min_ee_base_z = (
+            None if min_ee_base_z is None else float(min_ee_base_z)
+        )
+        self.min_left_ee_base_z = (
+            self.min_ee_base_z
+            if min_left_ee_base_z is None
+            else float(min_left_ee_base_z)
+        )
+        self.min_right_ee_base_z = (
+            self.min_ee_base_z
+            if min_right_ee_base_z is None
+            else float(min_right_ee_base_z)
+        )
         
         # 轨迹执行时间（camera_position 模式使用）
         self.trajectory_time = trajectory_time if trajectory_time is not None else (1.0 / hz) * 2.0
@@ -102,6 +136,7 @@ class RobotEnv:
         self._max_sensor_fallbacks = max(1, int(round(hz)))
         self._frozen_arm_pose_anchor: np.ndarray | None = None
         self._frozen_gripper_anchor: float | None = None
+        self._ee_z_clamp_counts = {"left": 0, "right": 0}
 
         if self.control_mode == "camera_position" and self.retargeter is None:
             self._init_retargeter(retargeter_urdf_path, retargeter_camera_extrinsic_path)
@@ -113,6 +148,27 @@ class RobotEnv:
                 f"[RobotEnv] 单臂硬件隔离已启用: freeze_arm={self.freeze_arm}; "
                 "将在 reset 后锁定该臂 ABS_POSE 与夹爪"
             )
+        if self.control_mode == "camera_position":
+            if (
+                self.min_left_ee_base_z is None
+                and self.min_right_ee_base_z is None
+            ):
+                print("[RobotEnv] EE base_link z 最低位置保护未启用")
+            else:
+                left_text = (
+                    "disabled"
+                    if self.min_left_ee_base_z is None
+                    else f"{self.min_left_ee_base_z:.4f}m"
+                )
+                right_text = (
+                    "disabled"
+                    if self.min_right_ee_base_z is None
+                    else f"{self.min_right_ee_base_z:.4f}m"
+                )
+                print(
+                    "[RobotEnv] EE base_link z 最低位置保护已启用: "
+                    f"left>={left_text}, right>={right_text}（低于时钳位后下发）"
+                )
 
     def _init_retargeter(self, urdf_path: Optional[str], extrinsic_path: Optional[str]):
         try:
@@ -298,6 +354,55 @@ class RobotEnv:
         else:
             self.robot_node.publish_joint_command_direct(action)
 
+    def _apply_ee_base_z_floor(
+        self, abs_action: np.ndarray, *, context: str
+    ) -> np.ndarray:
+        """Clamp an unsafe base-frame EE z target before it reaches the SDK.
+
+        The policy works in the calibrated camera frame, so its numeric z
+        component isn't a reliable table-height guard.  ``abs_action`` is the
+        post-retargeting ``base_link`` ABS_POSE command; indices 2 and 8 are
+        therefore the physical left/right z targets that must respect the
+        configured floor.
+        """
+
+        floors = (
+            ("left", 2, self.min_left_ee_base_z),
+            ("right", 8, self.min_right_ee_base_z),
+        )
+        if all(floor is None for _, _, floor in floors):
+            return abs_action
+        checked = _finite_vector(
+            abs_action, size=12, name=f"{context} IK 绝对位姿"
+        ).copy()
+        for name, index, floor in floors:
+            if floor is None or float(checked[index]) >= floor:
+                continue
+            original = float(checked[index])
+            checked[index] = float(floor)
+            if context == "reset":
+                # The task reset has already completed, so this is an
+                # observation warning rather than a claim that we changed the
+                # past reset command.  Subsequent EE commands are clamped.
+                print(
+                    "[RobotEnv] warning: reset EE base_link z 低于保护值: "
+                    f"side={name}, observed_z={original:.4f}m, "
+                    f"floor={float(floor):.4f}m；后续命令将钳位",
+                    flush=True,
+                )
+                continue
+            self._ee_z_clamp_counts[name] += 1
+            count = self._ee_z_clamp_counts[name]
+            if count == 1 or count % 30 == 0:
+                print(
+                    "[RobotEnv] EE base_link z 最低位置保护已钳位: "
+                    f"side={name}, original_z={original:.4f}m -> "
+                    f"command_z={float(floor):.4f}m, context={context}, "
+                    f"count={count}",
+                    flush=True,
+                )
+        return checked
+
     def _step_cartesian(self, action: np.ndarray):
         """笛卡尔位置控制（无 sleep）"""
         if action.shape != (14,):
@@ -354,6 +459,10 @@ class RobotEnv:
                 abs_action[6:12] = self._frozen_arm_pose_anchor
                 hand_right = self._frozen_gripper_anchor
 
+        # Final physical workspace boundary: check after retargeting and after
+        # optional hardware-arm freezing, immediately before SDK publication.
+        abs_action = self._apply_ee_base_z_floor(abs_action, context="command")
+
         action_abs = {
             "observation_timestamp": int(time.time() * 1e9),
             "head_joint_states": np.rad2deg(head_states).tolist(),
@@ -380,6 +489,7 @@ class RobotEnv:
             self._sensor_fallback_count = 0
             self._frozen_arm_pose_anchor = None
             self._frozen_gripper_anchor = None
+            self._ee_z_clamp_counts = {"left": 0, "right": 0}
 
             if "task_name" in kwargs:
                 from init_node_pos import init_node_pos
@@ -387,20 +497,62 @@ class RobotEnv:
                 init_node_pos(self.robot_node, kwargs["task_name"])
                 time.sleep(2.0)
             obs = self.get_obs()
+            left_pose = None
+            right_pose = None
+            if self.control_mode == "camera_position":
+                arm_pose_pair = self.robot_node.get_arm_pose_euler()
+                if arm_pose_pair is None or len(arm_pose_pair) != 2:
+                    floor_enabled = (
+                        self.min_left_ee_base_z is not None
+                        or self.min_right_ee_base_z is not None
+                    )
+                    if self.freeze_arm != "none" or floor_enabled:
+                        raise RuntimeError(
+                            "无法读取 reset 后的左右 ABS_POSE，已拒绝开始 EE 执行"
+                        )
+                    print(
+                        "[RobotEnv] warning: 无法读取 reset EE base_link z；"
+                        "最低位置保护未启用，本次继续运行"
+                    )
+                else:
+                    left_pose = _finite_vector(
+                        arm_pose_pair[0], size=6, name="reset left arm ABS_POSE"
+                    )
+                    right_pose = _finite_vector(
+                        arm_pose_pair[1], size=6, name="reset right arm ABS_POSE"
+                    )
+                    reset_abs_action = np.concatenate([left_pose, right_pose])
+                    self._apply_ee_base_z_floor(reset_abs_action, context="reset")
+                    left_floor_text = (
+                        "disabled"
+                        if self.min_left_ee_base_z is None
+                        else f"{self.min_left_ee_base_z:.4f}m"
+                    )
+                    right_floor_text = (
+                        "disabled"
+                        if self.min_right_ee_base_z is None
+                        else f"{self.min_right_ee_base_z:.4f}m"
+                    )
+                    print(
+                        "[RobotEnv] reset EE base_link z: "
+                        f"left={left_pose[2]:.4f}m, right={right_pose[2]:.4f}m, "
+                        f"left_floor={left_floor_text}, "
+                        f"right_floor={right_floor_text}"
+                    )
+
             if self.freeze_arm != "none":
+                if left_pose is None or right_pose is None:
+                    raise RuntimeError(
+                        "单臂冻结缺少 reset ABS_POSE 锚点，已拒绝开始"
+                    )
                 joint_state = _finite_vector(
                     obs["state/joint"], size=16, name="冻结锚点关节状态"
                 )
-                arm_pose_pair = self.robot_node.get_arm_pose_euler()
-                if arm_pose_pair is None or len(arm_pose_pair) != 2:
-                    raise RuntimeError(
-                        "无法读取冻结手臂的当前 ABS_POSE，已拒绝开始单臂测试"
-                    )
                 if self.freeze_arm == "left":
-                    frozen_pose = arm_pose_pair[0]
+                    frozen_pose = left_pose
                     gripper_state = float(joint_state[7])
                 else:
-                    frozen_pose = arm_pose_pair[1]
+                    frozen_pose = right_pose
                     gripper_state = float(joint_state[15])
                 self._frozen_arm_pose_anchor = _finite_vector(
                     frozen_pose,

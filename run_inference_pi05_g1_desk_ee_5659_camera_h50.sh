@@ -14,6 +14,9 @@
 # MAX_TIMESTEPS=1500 统计重采样后实际下发的命令，不是模型 row 数。
 # 单个 chunk 最多展开 500 步；超过时整个 chunk 在下发前拒绝，不会截断终点。
 # 夹爪使用 0=张开、1=闭合和 close=0.9/open=0.5 滞回阈值。
+# 真机标定后可分别设置左右末端最低位置，例如：
+#   MIN_LEFT_EE_BASE_Z=<左值_米> MIN_RIGHT_EE_BASE_Z=<右值_米> \
+#     bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50.sh
 #
 # 动作 JSONL/绘图默认已关闭；同时关闭 rollout 时只需：
 #   ROLLOUT_ENABLED=false \
@@ -38,7 +41,7 @@ exec env \
   GRIPPER_CLOSE_THRESHOLD="${GRIPPER_CLOSE_THRESHOLD:-0.9}" \
   GRIPPER_OPEN_THRESHOLD="${GRIPPER_OPEN_THRESHOLD:-0.50}" \
   ROLLOUT_ENABLED="${ROLLOUT_ENABLED:-true}" \
-  ROLLOUT_FPS="${ROLLOUT_FPS:-20}" \
+  ROLLOUT_FPS="${ROLLOUT_FPS:-30}" \
   ROLLOUT_OUTPUT_DIR="${ROLLOUT_OUTPUT_DIR:-}" \
   RETIME_ACTION_CHUNK="${RETIME_ACTION_CHUNK:-true}" \
   MAX_RETIMED_CHUNK_STEPS="${MAX_RETIMED_CHUNK_STEPS:-500}" \

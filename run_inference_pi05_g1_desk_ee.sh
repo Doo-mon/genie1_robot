@@ -9,6 +9,8 @@
 # chunk，夹爪仅在对应插值段的最后一步切换。RTC launcher 不使用该开关。
 # 夹爪约定 0=张开、1=闭合；默认 close=0.90/open=0.50 且启用二值化，
 # 中间区间保持上一命令。旧 GRIPPER_THRESHOLD 仅在显式设置时退回单阈值。
+# MIN_LEFT_EE_BASE_Z / MIN_RIGHT_EE_BASE_Z 分别设置左右末端最低 z（米）；
+# MIN_EE_BASE_Z 是兼容共同值，单臂值优先。低于阈值时会钳位后继续下发。
 # WS_* 控制本地转发首次等待、握手/响应超时和退避；已发送请求默认不重发，
 # 仅 WS_INFERENCE_RETRIES>0 才断线重连重发。"$@" 可作为最终参数覆盖。
 # PROMPT（兼容 FIXED_PROMPT）优先于 PROMPT_KEY；两者都未设置时由 Python 显示菜单，
@@ -44,6 +46,9 @@ CONTROL_FREQUENCY="${CONTROL_FREQUENCY:-20}"
 MAX_TIMESTEPS="${MAX_TIMESTEPS:-100}"
 MAX_POSITION_DELTA="${MAX_POSITION_DELTA:-0.0005}"
 MAX_ROTATION_DELTA="${MAX_ROTATION_DELTA:-0.0025}"
+MIN_EE_BASE_Z="${MIN_EE_BASE_Z:-}"
+MIN_LEFT_EE_BASE_Z="${MIN_LEFT_EE_BASE_Z:-}"
+MIN_RIGHT_EE_BASE_Z="${MIN_RIGHT_EE_BASE_Z:-}"
 TRAJECTORY_TIME="${TRAJECTORY_TIME:-0.10}"
 BINARIZE_GRIPPER="${BINARIZE_GRIPPER:-true}"
 GRIPPER_CLOSE_THRESHOLD="${GRIPPER_CLOSE_THRESHOLD:-0.90}"
@@ -51,7 +56,7 @@ GRIPPER_OPEN_THRESHOLD="${GRIPPER_OPEN_THRESHOLD:-0.50}"
 PROMPT="${PROMPT:-${FIXED_PROMPT:-}}"
 PROMPT_KEY="${PROMPT_KEY:-}"
 ROLLOUT_ENABLED="${ROLLOUT_ENABLED:-false}"
-ROLLOUT_FPS="${ROLLOUT_FPS:-${CONTROL_FREQUENCY}}"
+ROLLOUT_FPS="${ROLLOUT_FPS:-30}"
 ROLLOUT_OUTPUT_DIR="${ROLLOUT_OUTPUT_DIR:-}"
 RETIME_ACTION_CHUNK="${RETIME_ACTION_CHUNK:-false}"
 MAX_RETIMED_CHUNK_STEPS="${MAX_RETIMED_CHUNK_STEPS:-500}"
@@ -75,6 +80,15 @@ esac
 if [[ -n "${GRIPPER_THRESHOLD:-}" ]]; then
   # Compatibility for old launch commands: one value disables hysteresis.
   EXTRA_ARGS+=(--gripper-threshold="${GRIPPER_THRESHOLD}")
+fi
+if [[ -n "${MIN_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-ee-base-z="${MIN_EE_BASE_Z}")
+fi
+if [[ -n "${MIN_LEFT_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-left-ee-base-z="${MIN_LEFT_EE_BASE_Z}")
+fi
+if [[ -n "${MIN_RIGHT_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-right-ee-base-z="${MIN_RIGHT_EE_BASE_Z}")
 fi
 if [[ -n "${PROMPT}" ]]; then
   EXTRA_ARGS+=(--prompt="${PROMPT}")

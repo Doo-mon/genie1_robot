@@ -7,6 +7,8 @@
 # 控制慢启动等待、握手/响应超时和指数退避；
 # 夹爪按 0=张开、1=闭合解释；默认用 close=0.90/open=0.50 双阈值滞回，
 # 只有显式提供旧 GRIPPER_THRESHOLD 时才退回无记忆的单阈值。
+# MIN_LEFT_EE_BASE_Z / MIN_RIGHT_EE_BASE_Z 分别设置左右最低 z（米）；
+# MIN_EE_BASE_Z 是兼容共同值，单臂值优先，越界时钳位后继续执行。
 # 已发送请求默认不重发，只有 WS_INFERENCE_RETRIES>0 才断线重连重发。
 # PROMPT（兼容 FIXED_PROMPT）优先于 PROMPT_KEY；都为空时进入 Python 交互菜单，
 # 所有 prompt 在 reset、warmup 和启动 RTC 执行前都必须再次确认。
@@ -42,6 +44,9 @@ RTC_REFILL_AT="${RTC_REFILL_AT:-12}"
 BINARIZE_GRIPPER="${BINARIZE_GRIPPER:-true}"
 MAX_POSITION_DELTA="${MAX_POSITION_DELTA:-0.0005}"
 MAX_ROTATION_DELTA="${MAX_ROTATION_DELTA:-0.0025}"
+MIN_EE_BASE_Z="${MIN_EE_BASE_Z:-}"
+MIN_LEFT_EE_BASE_Z="${MIN_LEFT_EE_BASE_Z:-}"
+MIN_RIGHT_EE_BASE_Z="${MIN_RIGHT_EE_BASE_Z:-}"
 # 30 Hz 的控制周期约为 0.033 s。轨迹时间略短于一个周期，避免上一条
 # 单点 SDK 轨迹尚未完成就被下一条命令替换，从而产生反复启停和抖动。
 TRAJECTORY_TIME="${TRAJECTORY_TIME:-0.03}"
@@ -59,6 +64,15 @@ esac
 if [[ -n "${GRIPPER_THRESHOLD:-}" ]]; then
   # Legacy compatibility: a single threshold intentionally disables hysteresis.
   EXTRA_ARGS+=(--gripper-threshold="${GRIPPER_THRESHOLD}")
+fi
+if [[ -n "${MIN_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-ee-base-z="${MIN_EE_BASE_Z}")
+fi
+if [[ -n "${MIN_LEFT_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-left-ee-base-z="${MIN_LEFT_EE_BASE_Z}")
+fi
+if [[ -n "${MIN_RIGHT_EE_BASE_Z}" ]]; then
+  EXTRA_ARGS+=(--min-right-ee-base-z="${MIN_RIGHT_EE_BASE_Z}")
 fi
 if [[ -n "${PROMPT}" ]]; then
   EXTRA_ARGS+=(--prompt="${PROMPT}")

@@ -651,6 +651,12 @@ class EEArgs:
     # commanded translation/rotation rates at about 0.2 m/s and 1 rad/s.
     max_position_delta: float | None = 0.01
     max_rotation_delta: float | None = 0.05
+    # Backward-compatible common hard floor in the robot base_link ABS_POSE
+    # frame.  Per-arm values below override it independently.  All floors are
+    # checked after camera-frame retargeting and immediately before the SDK.
+    min_ee_base_z: float | None = None
+    min_left_ee_base_z: float | None = None
+    min_right_ee_base_z: float | None = None
     binarize_gripper: bool = False
     # 夹爪 action 约定 0=张开、1=闭合。二值模式从开到闭必须达到较高
     # close 阈值，从闭到开必须降到较低 open 阈值，中间带保持上次命令。
@@ -696,6 +702,14 @@ def validate_ee_args(args: EEArgs) -> None:
         value = getattr(args, name)
         if value is not None and (not np.isfinite(value) or value <= 0):
             raise ValueError(f"{name} must be finite and positive or None")
+    for name in (
+        "min_ee_base_z",
+        "min_left_ee_base_z",
+        "min_right_ee_base_z",
+    ):
+        value = getattr(args, name)
+        if value is not None and not np.isfinite(value):
+            raise ValueError(f"{name} must be finite or None")
     resolve_gripper_thresholds(
         gripper_threshold=args.gripper_threshold,
         gripper_close_threshold=args.gripper_close_threshold,

@@ -30,6 +30,16 @@ from policy_prompts import select_and_confirm_prompt
 
 def main(args: RTCArgs) -> None:
     validate_rtc_args(args)
+    left_z_floor = (
+        args.min_ee_base_z
+        if args.min_left_ee_base_z is None
+        else args.min_left_ee_base_z
+    )
+    right_z_floor = (
+        args.min_ee_base_z
+        if args.min_right_ee_base_z is None
+        else args.min_right_ee_base_z
+    )
     action_log = ActionLogSession(
         mode="ee", entrypoint="inference_pi05_g1_desk_ee_rtc"
     )
@@ -77,6 +87,12 @@ def main(args: RTCArgs) -> None:
         f"rotation={args.max_rotation_delta}"
     )
     print(f"  frozen EE/hardware arm at episode start: {freeze_arm}")
+    print(
+        "  base_link EE z floors: "
+        f"left={'disabled' if left_z_floor is None else f'{left_z_floor:.4f} m'}, "
+        f"right={'disabled' if right_z_floor is None else f'{right_z_floor:.4f} m'} "
+        "(clamp before SDK)"
+    )
     print("=" * 72)
 
     env = None
@@ -92,6 +108,9 @@ def main(args: RTCArgs) -> None:
                 hz=args.control_frequency,
                 trajectory_time=trajectory_time,
                 freeze_arm=freeze_arm,
+                min_ee_base_z=args.min_ee_base_z,
+                min_left_ee_base_z=args.min_left_ee_base_z,
+                min_right_ee_base_z=args.min_right_ee_base_z,
             )
 
         warmed_up = False

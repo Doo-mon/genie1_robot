@@ -67,7 +67,7 @@ class SyncRolloutArgs(EEArgs):
     """EE 同步推理参数；rollout 默认关闭，由 launcher 按任务开启。"""
 
     rollout_output_dir: str | None = None
-    rollout_fps: float = 20.0
+    rollout_fps: float = 30.0
     rollout_enabled: bool = False
     # Only the synchronous EE entrypoint consumes these fields.  RTC keeps its
     # original fixed-H policy timeline and never inherits this retiming mode.
@@ -82,6 +82,16 @@ def main(args: SyncRolloutArgs) -> None:
     import tqdm
 
     validate_ee_args(args)
+    left_z_floor = (
+        args.min_ee_base_z
+        if args.min_left_ee_base_z is None
+        else args.min_left_ee_base_z
+    )
+    right_z_floor = (
+        args.min_ee_base_z
+        if args.min_right_ee_base_z is None
+        else args.min_right_ee_base_z
+    )
     action_log = ActionLogSession(
         mode="ee", entrypoint="inference_pi05_g1_desk_ee"
     )
@@ -152,6 +162,12 @@ def main(args: SyncRolloutArgs) -> None:
                 f"close>={close_threshold:g}, open<={open_threshold:g}"
             )
     print(f"  frozen EE arm at episode start: {resolved_freeze_arm}")
+    print(
+        "  base_link EE z floors: "
+        f"left={'disabled' if left_z_floor is None else f'{left_z_floor:.4f} m'}, "
+        f"right={'disabled' if right_z_floor is None else f'{right_z_floor:.4f} m'} "
+        "(clamp before SDK)"
+    )
     print(f"  synchronous chunk retiming: {args.retime_action_chunk}")
     if args.retime_action_chunk:
         print(
@@ -185,6 +201,9 @@ def main(args: SyncRolloutArgs) -> None:
                 hz=args.control_frequency,
                 trajectory_time=trajectory_time,
                 freeze_arm=resolved_freeze_arm,
+                min_ee_base_z=args.min_ee_base_z,
+                min_left_ee_base_z=args.min_left_ee_base_z,
+                min_right_ee_base_z=args.min_right_ee_base_z,
             )
 
         while True:

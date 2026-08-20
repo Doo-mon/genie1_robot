@@ -170,6 +170,32 @@ EE14 的固定顺序为：
 
 夹爪在 state 与 action 中使用不同数值空间：机器人反馈 state 是 0--120 的编码器位置，模型 action 是连续 0--1；当前训练数据约定二者同方向变化，`0=张开、1/120=闭合`。模型响应 `actions` 必须是有限值 `H x 14`。下发前会按左右臂分别限制位置和轴角的单步变化。所有活跃 EE Shell 默认开启夹爪二值化，并统一使用双阈值滞回：action 从张开状态上升到 `0.90` 才闭合，从闭合状态下降到 `0.50` 才张开，中间区间保持上次命令。设置 `BINARIZE_GRIPPER=false` 可原样保留连续 action；需要更晚松爪时仍可在单次命令中显式降低 `GRIPPER_OPEN_THRESHOLD`。启用 `freeze_left_arm` 时，完整左侧 7D EE 目标固定为 episode 起点，其中夹爪 state 会先除以 120 转换到 action 空间，避免把 0--120 state 写进动作队列。
 
+### 2.2 EE 末端最低高度保护
+
+EE14 中的 xyz 位于策略/相机标定坐标系，其 z 不能直接当作桌面高度。
+`MIN_LEFT_EE_BASE_Z` 与 `MIN_RIGHT_EE_BASE_Z` 分别指定机器人
+`base_link` 坐标系中左右末端允许的最小 ABS_POSE z（米）。旧的
+`MIN_EE_BASE_Z` 保留为左右共同回退值；某侧设置了独立值时，以独立值优先。
+保护在相机标定/IK 转换之后、冻结手臂处理之后、SDK 下发之前执行，因此同步
+EE、RTC、rollout、重采样和单臂模式都不能绕过。
+
+该参数默认留空，因为不同标定和机位下的 `base_link` 桌面 z 不能猜测。应先在
+真机上测得桌面 z，再加上夹爪/工具尖端到 EE 原点的垂向长度和安全余量。
+例如分别标定出左右安全值后：
+
+```bash
+MIN_LEFT_EE_BASE_Z=<左侧标定值_米> \
+MIN_RIGHT_EE_BASE_Z=<右侧标定值_米> \
+  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_rollout_rtc.sh
+```
+
+reset 后程序会读取并打印左右臂当前 ABS_POSE z。后续某侧命令低于其阈值时，
+程序会在送入 SDK 前只把该侧 base_link z 钳位到阈值，其他位置、姿态和另一侧
+保持不变，并在首次及每 30 次钳位时打印计数。episode 不会因此退出。注意钳位
+发生在物理 SDK 命令空间，模型/RTC 目标仍可能低于地板；控制台钳位日志代表
+实际 base_link z 已与模型目标不同。该保护限制的是下发目标，不取代硬件急停、
+力控或独立的高频反馈安全监控。
+
 EE rollout 与线上命令维度不同：
 
 ```text
@@ -179,7 +205,7 @@ action            = [joint16_feedback, executed_ee14] = 30D
 
 真正发给 `RobotEnv.step()` 的仍是 14D。数据集 action 的前 16D 是同步关节反馈，训练侧 EE transform 会忽略它；后 14D 是经过安全处理、实际下发的命令。
 
-### 2.2 joint：统一 joint16 顺序
+### 2.3 joint：统一 joint16 顺序
 
 机器人观测、模型输入/输出、RTC 队列、prefix、实际命令及 rollout 始终采用：
 
@@ -363,7 +389,7 @@ FREEZE_ARM=left \
 
 RTC 对服务端响应先应用同一侧 EE7 冻结，再生成 committed prefix 和 hard-lock，因此模型时间线、实际 EE 命令与硬件侧 `ABS_POSE` 冻结保持一致。RTC 不使用同步版的整块可变长度重采样：服务端 prefix 仍按原始模型 timestep 对齐，未冻结手臂继续使用每 tick 位置/旋转限幅。位置按欧氏距离推进，旋转使用 quaternion SLERP 的 SO(3) 最短路径，不会在轴角正负 pi 边界绕远路。二值夹爪发生切换时是唯一例外：RTC 把该模型行留在队首并保持旧夹爪，通过 `RobotEnv.step_with_control_feedback()` 在同一硬件锁内下发手臂命令并读取 fresh EE14 feedback。对应手臂的位置误差默认需小于 5 mm、最短 SO(3) 旋转误差小于 0.05 rad，并连续满足 3 帧；之后才在下一 tick 切换夹爪，同时保持 EE 目标 0.20 秒。以上阶段全部完成后才弹出这一行、增加一次模型时间线 pop count，并默认丢弃抓取/释放前预测的旧 tail、用新观测请求 fresh chunk。门控先按当前距离、位置/旋转单步限制和频率估算理想推进时间，再加入 SDK 轨迹、稳定帧、夹爪保持及至少 1 秒/50% 跟踪余量；总超时至少 5 秒、最多 30 秒。理论所需时间超过30秒时会在建立门控时直接拒绝，避免对异常目标无限等待。若 `max_timesteps` 在门控中耗尽，episode 会明确失败而非标记 completed。同步 EE 不调用这套状态机。
 
-需要 literal prompt 时可设置 `PROMPT='完整文本'`。通用同步 EE launcher 的 rollout 默认关闭，可用 `ROLLOUT_ENABLED=true`开启；通用 RTC-rollout launcher 也可用 `ROLLOUT_ENABLED=0` 关闭。`ROLLOUT_FPS` 设置采集频率，`ROLLOUT_OUTPUT_DIR` 指定数据集根目录。
+需要 literal prompt 时可设置 `PROMPT='完整文本'`。通用同步 EE launcher 的 rollout 默认关闭，可用 `ROLLOUT_ENABLED=true`开启；通用 RTC-rollout launcher 也可用 `ROLLOUT_ENABLED=0` 关闭。`ROLLOUT_FPS` 默认 30 Hz，可显式覆盖采集频率；`ROLLOUT_OUTPUT_DIR` 指定数据集根目录。
 
 ## 4. WebSocket metadata + infer 协议
 
