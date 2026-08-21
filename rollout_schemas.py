@@ -4,8 +4,8 @@ EE schema 保存 30 维 ``[joint16, ee14]`` 状态，以及 ``[joint16_feedback,
 joint schema 的 state/action 均为 16 维 ``[L7, Lhand, R7, Rhand]``，不进行索引重排。
 写入的动作始终是经过限幅和夹爪处理、实际交给 RobotEnv 的命令，而非原始模型目标。
 本模块依赖 NumPy、两个纯 policy 模块和 ``RolloutSchema``，不执行硬件、网络或文件 I/O。
-同步 EE、RTC EE 与 joint rollout 入口把对应 schema 交给通用 recorder 使用；
-同步/RTC EE 虽共用维度和编码，但 processing_mode 分开，禁止混写数据集。
+同步、预取、RTC 的 EE/joint rollout 入口把对应 schema 交给通用 recorder；
+相同维度与编码可复用，但 processing_mode 按执行时序分开，禁止混写数据集。
 编码阶段再次执行严格维度与有限值校验，并为 state/action 生成一致的 modality 区间。
 """
 
@@ -99,6 +99,13 @@ EE_SYNC_ROLLOUT_SCHEMA = dataclasses.replace(
     processing_mode="ee_sync_inference_rollout",
 )
 
+# 异步预取仍执行同步重采样 command，但其 chunk 来源和普通同步不同，使用
+# 独立 processing_mode，防止两种时序的数据被追加到同一 rollout 根目录。
+EE_PREFETCH_ROLLOUT_SCHEMA = dataclasses.replace(
+    EE_ROLLOUT_SCHEMA,
+    processing_mode="ee_sync_prefetch_inference_rollout",
+)
+
 JOINT_ROLLOUT_SCHEMA = RolloutSchema(
     name="joint",
     control_mode="joint_position",
@@ -116,4 +123,9 @@ JOINT_ROLLOUT_SCHEMA = RolloutSchema(
     processing_mode="joint_rtc_inference_rollout",
     modality_mapping=JOINT_MODALITY,
     encode_frame=_joint_frame,
+)
+
+JOINT_PREFETCH_ROLLOUT_SCHEMA = dataclasses.replace(
+    JOINT_ROLLOUT_SCHEMA,
+    processing_mode="joint_sync_prefetch_inference_rollout",
 )

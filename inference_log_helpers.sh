@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 六个通用推理 launcher 共用的日志与退出绘图辅助函数。
+# 八个通用推理 launcher 共用的日志与退出绘图辅助函数。
 #
 # 调用方先 source 本文件，再初始化唯一的“时间戳+入口名+PID”运行目录，并通过
 # inference_log_run 执行 Python。日志相关 Shell 变量不会 export 到父终端；只有

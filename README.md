@@ -5,19 +5,21 @@
 ## 1. 模块图与文件职责
 
 ```text
-11 个 run_*.sh launcher
-├── 6 个通用 launcher ───────────────┐
-├── 1 个 5659 同步 EE preset ──> 通用 EE launcher
-└── 2 个 EE rollout preset ─────> 通用 EE rollout launcher
+15 个 run_*.sh launcher
+├── 8 个通用 launcher（含 EE/joint prefetch）──────┐
+├── 4 个 5659 同步/预取 preset ──> 对应通用 launcher
+└── 3 个 EE RTC preset/wrapper ───> 通用 EE rollout launcher
                                       │
                                       v
-6 个 desk Python 入口 + inference.py 兼容入口
+8 个 desk Python 入口 + inference.py 兼容入口
 ├── policy_prompts.py       prompt 目录、key 解析、人工确认
 ├── inference_common.py     URI、超时/退避、WebSocket、图像与运行时工厂
 │   ├── websockets.sync.client
 │   └── openpi-client/.../msgpack_numpy.py
 ├── policy_ee.py            EE14 / 30D 数据合同与动作安全处理
+├── policy_ee_prefetch.py   同步队列尾部的单请求异步预取
 ├── policy_joint.py         joint16 数据合同与动作安全处理
+├── policy_joint_prefetch.py joint重采样与尾部异步预取
 ├── policy_ee_rtc.py        EE 双线程 RTC、前缀硬锁、停止/取消
 ├── policy_joint_rtc.py     joint 双线程 RTC、前缀模拟/硬锁、停止/取消
 ├── action_logging.py       策略 I/O 与原始/有效/实际动作逐行日志、写盘耗时监测
@@ -35,15 +37,19 @@
 |---|---|
 | `inference_common.py` | 所有活跃入口共用的可靠同步 WebSocket 客户端；在没有安装包时把 vendored `openpi-client/src` 加入导入路径；延迟创建 `RobotEnv`。 |
 | `policy_ee.py` | 构造 EE 请求、校验 `H x 14` 响应、位置/旋转单步限幅、夹爪二值化、可选冻结左 EE，以及同步 EE 的 SO(3) chunk 时间重采样。 |
+| `policy_ee_prefetch.py` | 独立同步预取参数与后台工作器；把当前队列尚未下发的 0--1 EE14 command 作为 prefix，只交付响应中 prefix 之后的未来动作。 |
 | `policy_joint.py` | 构造 joint 请求、校验 `H x 16` 响应、关节单步限幅和夹爪二值化；当前模型与机器人顺序相同，不做旧式重排。 |
+| `policy_joint_prefetch.py` | 独立 joint16 整块重采样与后台预取；14个手臂关节共享插值子步，夹爪只在模型 row 的 endpoint 切换。 |
 | `policy_ee_rtc.py` / `policy_joint_rtc.py` | 推理线程与执行线程并行；低水位补 chunk、按已经执行的步数对齐响应、硬锁已承诺前缀。 |
 | `policy_prompts.py` | joint、EE、bread prompt 分组，named prompt，literal/key/菜单选择与最终人工确认。 |
 | `rollout_schemas.py` | 定义 EE 和 joint 数据集维度、顺序，以及“实际下发命令”如何进入 action；同步 EE 与 RTC EE 使用不同 processing mode。 |
 | `rollout_recorder.py` | 以独立帧率抓取三路 RGB；后台写 MP4、Parquet 和 `meta/*`；只有启用录制时才加载 OpenCV/PyArrow。 |
 | `action_logging.py` | 为每个进程保存 run 配置、策略数值输入/原始响应，以及每条成功执行的原始服务端输出、有效目标和实际命令；同时监测同步写盘对控制周期的占用。 |
 | `plot_action_log.py` | 纯标准库离线绘图；EE 生成 14 张、joint 生成 16 张逐维 SVG，并额外生成一张全维度总览；同一维度叠加原始输出、有效目标和实际命令。 |
-| `inference_log_helpers.sh` | 六个通用 launcher 共用的时间戳目录、console 捕获、动作日志开关、退出绘图和退出码保留函数。 |
+| `inference_log_helpers.sh` | 八个通用 launcher 共用的时间戳目录、console 捕获、动作日志开关、退出绘图和退出码保留函数。 |
 | `inference_pi05_g1_desk_{ee,joint}.py` | 同步 chunk 推理入口；EE 入口另支持可选的 chunk 重采样和同步 rollout。 |
+| `inference_pi05_g1_desk_ee_prefetch.py` | 独立同步 EE 重采样 + 单请求异步预取入口；完整执行当前队列后才接入未来尾部。 |
+| `inference_pi05_g1_desk_joint_prefetch.py` | 独立同步 joint 重采样 + 单请求异步预取入口；joint16 全程保持统一顺序。 |
 | `inference_pi05_g1_desk_{ee,joint}_rtc.py` | RTC 执行但不录制。 |
 | `inference_pi05_g1_desk_{ee,joint}_rollout_rtc.py` | RTC 执行并可录制 rollout。 |
 | `inference.py` | 兼容 bread/旧 18D、20D 控制链路；也使用同一 WebSocket 工厂，但不要把它的维度定义混入 desk EE/joint 合同。 |
@@ -52,27 +58,31 @@
 | `server_src/` | 服务端模型、RTC policy、WebSocket server 和训练配置的参考快照；客户端运行时不导入、不测试该目录。其中历史 dataset/checkpoint 绝对路径只记录原服务端部署，现场使用时应通过环境变量或启动参数覆盖。 |
 | `env_for_g1.sh` | 激活机器人 SDK/conda 环境并进入工作区；应使用 `source`。 |
 
-活跃的 11 个 Shell launcher：
+活跃的 15 个 Shell launcher：
 
 | launcher | 模式 | prompt profile / 默认 key | 默认本地端口 |
 |---|---|---|---:|
 | `run_inference_pi05_g1_desk_ee.sh` | EE 同步 | `ee` | 2379 |
+| `run_inference_pi05_g1_desk_ee_prefetch.sh` | EE 同步重采样 + 异步预取 | `ee` | 2379 |
 | `run_inference_pi05_g1_desk_ee_5659_camera_h50.sh` | 5659 同步 EE + 重采样 + rollout preset | `named:5659-all` | 继承通用 EE |
-| `run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm.sh` | 5659 同步 EE 单臂隔离测试；冻结指定手臂 | `named:5659-all` | 继承 5659 同步 preset |
-| `run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm_rollout_rtc.sh` | 5659 RTC + rollout 单臂隔离测试 | `named:5659-all` | 继承 5659 RTC preset |
+| `run_inference_pi05_g1_desk_ee_5659_camera_h50_prefetch.sh` | 5659 双臂同步重采样 + 异步预取 preset | `named:5659-all` | 继承通用 prefetch |
+| `run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right.sh` | 5659 同步 EE；固定右臂、只执行左臂 | `named:5659-all` | 继承 5659 同步 preset |
+| `run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right_prefetch.sh` | 5659 同步重采样 + 异步预取；固定右臂 | `named:5659-all` | 继承通用 prefetch |
+| `run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right_rollout_rtc.sh` | 5659 RTC + rollout；固定右臂、只执行左臂 | `named:5659-all` | 继承 5659 RTC preset |
 | `run_inference_pi05_g1_desk_ee_rtc.sh` | EE RTC | `ee` | 2379 |
 | `run_inference_pi05_g1_desk_ee_rollout_rtc.sh` | EE RTC + rollout | `ee` | 2379 |
 | `run_inference_pi05_g1_desk_ee_3017_3040_h50_rollout_rtc.sh` | EE rollout preset | `named:bread-all`，`breads` 初始姿态 | 继承通用 EE |
 | `run_inference_pi05_g1_desk_ee_5659_camera_h50_rollout_rtc.sh` | EE rollout preset | `named:5659-all` | 继承通用 EE |
 | `run_inference_pi05_g1_desk_joint.sh` | joint 同步 | `joint` | 2379 |
+| `run_inference_pi05_g1_desk_joint_prefetch.sh` | joint 同步重采样 + 异步预取 | `joint` | 2379 |
 | `run_inference_pi05_g1_desk_joint_rtc.sh` | joint RTC | `joint` | 2379 |
 | `run_inference_pi05_g1_desk_joint_rollout_rtc.sh` | joint RTC + rollout | `joint` | 2379 |
 
-三个 preset 不直接运行 Python；它们用命令级环境变量补充默认值，再 `exec` 对应的通用 EE 或 EE rollout launcher。调用者已经设置的同名变量优先，`"$@"` 最后继续传给 Python。5659 同步 preset 不启用 RTC，但默认开启同步 rollout 和 chunk 重采样。它当前以 30 Hz 选取 H50 全部模型行，然后展开为相邻位置/SO(3) 旋转不超过 `0.002 m / 0.01 rad`的可变长执行队列。夹爪仅在对应模型 segment 的最后一个插值步切换；`MAX_TIMESTEPS=1500` 统计实际下发的重采样命令。
+这些 preset/wrapper 不直接运行 Python；它们用命令级环境变量补充默认值，再 `exec` 对应的通用 EE 或 EE rollout launcher。调用者已经设置的同名变量优先，`"$@"` 最后继续传给 Python。5659 同步 preset 不启用 RTC，但默认开启同步 rollout 和 chunk 重采样。它当前以 30 Hz 选取 H50 全部模型行，然后展开为相邻位置/SO(3) 旋转不超过 `0.002 m / 0.01 rad`的可变长执行队列。夹爪仅在对应模型 segment 的最后一个插值步切换；`MAX_TIMESTEPS=1500` 统计实际下发的重采样命令。
 
 ### 1.1 每次运行的输入/动作日志与自动绘图
 
-十一个 launcher 最终都会经过同一套日志入口。Shell 默认关闭动作/策略 JSONL
+十五个 launcher 最终都会经过同一套日志入口。Shell 默认关闭动作/策略 JSONL
 和真实 feedback 读取，只在默认的 `./logs/` 时间戳目录保存 `console.log`，避免
 诊断读取占用20/30Hz控制周期。显式设置 `ACTION_LOGGING=true` 后目录内容为：
 
@@ -365,29 +375,62 @@ RETIME_ACTION_CHUNK=false \
   bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50.sh
 ```
 
-单臂隔离测试中，`FREEZE_ARM` 表示需要固定的手臂；另一只手臂正常执行：
+固定右臂、只执行左臂时使用专用同步入口：
 
 ```bash
-# 固定左臂，只测试右臂
-FREEZE_ARM=left \
-  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm.sh
-
-# 固定右臂，只测试左臂
-FREEZE_ARM=right \
-  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm.sh
+MAX_TIMESTEPS=100 \
+  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right.sh
 ```
 
-冻结首先覆盖所选手臂的完整 EE7（位置、轴角旋转和夹爪），随后在 IK 完成后再次把该臂发送给 SDK 的 6 维 `ABS_POSE` 和夹爪命令锁定到 episode reset 后的实测锚点。双层冻结可避免 IK 分支变化让测试中本应静止的手臂产生物理运动。未冻结手臂继续使用 5659 同步重采样和原有限幅；动作日志仍保留服务端原始双臂输出，因此可以对照模型是否在被冻结的一侧产生了异常目标。
+冻结首先覆盖右臂的完整 EE7（位置、轴角旋转和夹爪），随后在 IK 完成后再次把右臂发送给 SDK 的 6 维 `ABS_POSE` 和夹爪命令锁定到 episode reset 后的实测锚点。若 reset 锚点低于右侧高度保护值，则安全高度优先。双层冻结可避免 IK 分支变化让本应静止的右臂产生物理运动。左臂继续使用 5659 同步重采样和原有限幅；动作日志仍保留服务端原始双臂输出，因此可以对照模型是否在右侧产生异常目标。
 
-同步入口只在执行队列为空时请求下一块，因此服务端推理期间会保持最后命令；插值只能平滑 chunk 内部，不能消除 chunk 之间的等待。需要连续执行时应使用对应的单臂 RTC 入口：
+该 launcher 默认使用左右高度 `0.585/0.575 m`、`MAX_TIMESTEPS=4000`，部署前仍建议先用较小步数测试。参数均可按次覆盖：
 
 ```bash
-# 固定左臂，只让右臂走 RTC；改成 right 即只测试左臂
-FREEZE_ARM=left \
-  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_single_arm_rollout_rtc.sh
+MAX_TIMESTEPS=4000 \
+MIN_LEFT_EE_BASE_Z=0.585 \
+MIN_RIGHT_EE_BASE_Z=0.575 \
+  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right.sh
 ```
 
-RTC 对服务端响应先应用同一侧 EE7 冻结，再生成 committed prefix 和 hard-lock，因此模型时间线、实际 EE 命令与硬件侧 `ABS_POSE` 冻结保持一致。RTC 不使用同步版的整块可变长度重采样：服务端 prefix 仍按原始模型 timestep 对齐，未冻结手臂继续使用每 tick 位置/旋转限幅。位置按欧氏距离推进，旋转使用 quaternion SLERP 的 SO(3) 最短路径，不会在轴角正负 pi 边界绕远路。二值夹爪发生切换时是唯一例外：RTC 把该模型行留在队首并保持旧夹爪，通过 `RobotEnv.step_with_control_feedback()` 在同一硬件锁内下发手臂命令并读取 fresh EE14 feedback。对应手臂的位置误差默认需小于 5 mm、最短 SO(3) 旋转误差小于 0.05 rad，并连续满足 3 帧；之后才在下一 tick 切换夹爪，同时保持 EE 目标 0.20 秒。以上阶段全部完成后才弹出这一行、增加一次模型时间线 pop count，并默认丢弃抓取/释放前预测的旧 tail、用新观测请求 fresh chunk。门控先按当前距离、位置/旋转单步限制和频率估算理想推进时间，再加入 SDK 轨迹、稳定帧、夹爪保持及至少 1 秒/50% 跟踪余量；总超时至少 5 秒、最多 30 秒。理论所需时间超过30秒时会在建立门控时直接拒绝，避免对异常目标无限等待。若 `max_timesteps` 在门控中耗尽，episode 会明确失败而非标记 completed。同步 EE 不调用这套状态机。
+该入口是普通同步 EE，不使用 RTC。它只在当前重采样队列执行完后请求下一块，因此服务端推理期间会保持最后命令；插值能平滑 chunk 内部，但不能消除 chunk 之间的推理等待。
+
+若要保持相同的同步重采样轨迹，同时只把下一次网络请求移到当前队列尾部，使用
+独立 prefetch 入口：
+
+```bash
+# 双臂5659
+MAX_TIMESTEPS=100 \
+ROLLOUT_ENABLED=false \
+  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_prefetch.sh
+
+# 固定右臂，只执行左臂
+MAX_TIMESTEPS=100 \
+ROLLOUT_ENABLED=false \
+  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right_prefetch.sh
+```
+
+它默认在当前队列剩余24条实际 command 时读取一次新观测，并把这24条尚未
+下发的 command 以 0--1 EE14 prefix 发送给服务端。前台继续完整执行原队列；
+后台响应的 prefix 部分不会进入机器人，只有后面的未来动作会在原队列结束后
+重采样并接入。该模式不具备 RTC 的持续纠偏能力，目标只是消除普通同步模式的
+边界推理等待，同时尽量保留第一次观测生成的 H50 动作。若响应仍未完成，程序
+会在边界明确等待，不用新响应覆盖当前 chunk。
+
+需要 RTC 连续推理时使用对应的固定右臂入口：
+
+```bash
+MAX_TIMESTEPS=100 \
+  bash ./run_inference_pi05_g1_desk_ee_5659_camera_h50_freeze_right_rollout_rtc.sh
+```
+
+RTC 版本同样固定右臂并使用左右 `0.585/0.575 m` 高度保护。为了让 H50
+绝大多数动作继续采用第一次观测生成的 chunk，它单独使用轻量交接
+`RTC_PREFIX_LEN=24`、`RTC_REFILL_AT=26`：先执行24行，剩26行才请求，并
+硬锁其中24行，理想情况下前48/50行保持原预测，只有最后约2行参与下一块
+衔接。原有 5659 RTC preset 的 `24/34` 不变。该版本不使用同步整块重采样；
+左臂按每 tick 位置/旋转上限执行，夹爪切换默认等待左臂物理反馈稳定到位后
+发生。设置 `ROLLOUT_ENABLED=false` 只关闭数据保存，不会关闭 RTC。
 
 需要 literal prompt 时可设置 `PROMPT='完整文本'`。通用同步 EE launcher 的 rollout 默认关闭，可用 `ROLLOUT_ENABLED=true`开启；通用 RTC-rollout launcher 也可用 `ROLLOUT_ENABLED=0` 关闭。`ROLLOUT_FPS` 默认 30 Hz，可显式覆盖采集频率；`ROLLOUT_OUTPUT_DIR` 指定数据集根目录。
 
@@ -484,6 +527,7 @@ observation dict
 | 模式 | 推理/执行关系 | chunk 使用 | 网络中断时的运行表现 | 录制 |
 |---|---|---|---|---|
 | 同步 | 同一线程先 infer，再执行 | 可用 `chunk_skip` 丢开头、用 `execution_horizon` 选窗口 | 等待 infer 时没有新的命令下发；失败传播到 episode/入口 | EE 可选；5659 同步 preset 默认开启 |
+| 同步 + prefetch | 当前重采样队列前台完整执行，尾部单次 infer 后台运行 | 剩余 command 全部作为 prefix；只接入响应未来尾部 | 当前队列仍执行完；响应迟到则边界等待，失败在边界传播 | EE/joint 均可选，processing mode 独立 |
 | RTC | 推理线程和固定频率执行线程并行 | `chunk_skip=0`；队列低于 `rtc_refill_at` 时补充；锁定最多 `rtc_prefix_len` 个承诺动作 | 仍消费已有队列；队列空时不再下发新目标，底层保持最后命令；结束时关闭阻塞 socket | 无 |
 | RTC + rollout | 与 RTC 完全相同 | 与 RTC 完全相同 | 与 RTC 完全相同 | 独立采样线程按 `rollout_fps` 记录三路 RGB、反馈和实际命令 |
 
@@ -504,6 +548,55 @@ observation dict
 `execution_horizon` 统计采用的模型 row；`max_timesteps` 统计重采样后成功下发的 command。单 chunk 超过 `MAX_RETIMED_CHUNK_STEPS` 会在第一条真机命令之前整体拒绝，不会截断 endpoint 或夹爪事件。终端每个 chunk 打印 `model_rows -> commands`、最大 segment 展开倍数和预计执行时间；展开过大时应减少 `EXECUTION_HORIZON`或重新评估限幅，不应只把安全上限抬高。
 
 重采样模式不会在 chunk 边界改用滞后的反馈重置 command 基线，因此这些上限连续约束相邻成功下发 EE target command（包括两个 chunk 之间）；`actions.jsonl` 中的 `command_action`（及旧别名 `actual_action`）是这个命令，绿色 `feedback_action` 才是提交后的即时传感器/FK反馈。策略请求仍使用每次新读取的观测。真实机械臂还受 SDK 轨迹控制、`TRAJECTORY_TIME`、跟踪误差和反馈频率影响；feedback/rollout state 才可用于观察跟踪情况。
+
+### 6.2 同步队列 + 异步预取（EE 与 joint）
+
+`inference_pi05_g1_desk_ee_prefetch.py` 是独立实验入口，原同步与 RTC 都不会
+导入它。其时间线为：
+
+```text
+无 prefix 获取第一块 H50
+-> freeze + SO(3) 重采样
+-> 完整执行当前 command 队列
+   └─ 队列剩余 P 条时，以“同一时刻的新观测 + 全部 P 条未执行 command”后台 infer
+-> 当前队列归零
+-> 丢弃响应前 P 行，只重采样并执行响应的未来尾部
+```
+
+`PREFETCH_PREFIX_LEN` 必须满足 `1 <= P < ACTION_HORIZON`，默认 H50 使用24。
+30 Hz 下24条提供约0.8秒后台预算，并使每个响应最多新增26个模型 row。增大 P
+会更早发请求，但也会缩短真正新增的未来段；减小 P 保留更多新动作，但推理更
+容易赶不上。参数只影响网络衔接，不改变 `MAX_POSITION_DELTA`、
+`MAX_ROTATION_DELTA` 或重采样算法。
+
+该入口要求服务端 `serve_policy.py` 使用 `RTC_ENABLE=true` 或等价 `--rtc` 包装
+prefix guidance。当前服务端 metadata 没有发布 RTC enabled 字段，客户端无法
+自动验证；若连接普通非 RTC serve，额外字段会被忽略，响应尾部不具备预期的
+轨迹连续性，因此不要用普通 serve 运行本入口。
+
+prefix 直接取尚未下发的重采样 command，因此夹爪严格为模型 action 的0--1
+空间，不使用反馈 state 的0--120。前台不依据响应到达时间 pop、丢弃或替换
+当前动作；这也是它和 RTC 的主要区别。动作日志 source 为
+`ee_sync_prefetch_retimed_command`，rollout 使用独立
+`ee_sync_prefetch_inference_rollout` processing mode，不能与普通同步或 RTC
+数据集混写。
+
+joint 对应入口为：
+
+```bash
+MAX_TIMESTEPS=100 \
+ROLLOUT_ENABLED=false \
+  bash ./run_inference_pi05_g1_desk_joint_prefetch.sh
+```
+
+默认 H30/P18，约给后台0.6秒，同时每个响应新增12个模型 row。joint 当前没有
+普通同步入口的整块重采样开关，因此该独立入口在预取之外还会把每个绝对
+joint16 target 按 `MAX_JOINT_DELTA` 展开；14个手臂关节取统一最大子步数，
+两个夹爪只在对应模型 row 的最后子步切换。prefix、模型和机器人均保持
+`[L7,Lhand,R7,Rhand]`，不发生旧式重排。该入口拒绝
+`USE_SMOOTH_TRAJECTORY`，因为SDK整段Ruckig调用会阻塞固定频率时间线。
+joint rollout 使用 `joint_sync_prefetch_inference_rollout`，也不能和 joint RTC
+数据集混写。
 
 RTC 第一个请求没有 prefix。后续请求携带：
 
